@@ -1,0 +1,23 @@
+# Phase 2 machine-learning dependencies.
+# Install after requirements.txt:
+#   .\.venv\Scripts\python.exe -m pip install -r requirements-ml.txt
+#
+# This machine runs under an Application Control policy that blocks PyTorch's
+# c10.dll, so BGE-M3 is executed through ONNX Runtime instead of
+# sentence-transformers/torch. Use the ONNX download mode:
+#   .\.venv\Scripts\python.exe scripts\download_models.py --backend onnx
+
+onnxruntime>=1.18,<2
+tokenizers>=0.19,<1
+huggingface-hub>=0.27,<2
+PyMuPDF>=1.24,<2
+numpy>=1.26
+
+# Phase 6 voice transcription uses CTranslate2 (no PyTorch dependency).
+faster-whisper>=1.1,<2
+
+# Optional Phase 2 OCR for scanned pages. It is installed separately because
+# PaddlePaddle is a large, platform-specific download:
+#   .\.venv\Scripts\python.exe -m pip install paddleocr paddlepaddle
+# Then set INGESTION_OCR_ENABLED=true in config/.env. OCR supplements the
+# vision analysis; the pages are still analyzed by the vision provider.

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Environment / secrets
+config/.env
+.env
+*.pem
+*.key
+
+# Local development database (pgserver data directory)
+.pgdata/
+.pgdata-test/
+
+# Backups
+backups/
+
+# Runtime data
+data/documents/*
+!data/documents/.gitkeep
+data/document_versions/*
+!data/document_versions/.gitkeep
+data/rendered_pages/*
+!data/rendered_pages/.gitkeep
+data/temporary/*
+!data/temporary/.gitkeep
+models/*
+!models/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

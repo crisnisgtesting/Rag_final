@@ -1,0 +1,38 @@
+[Unit]
+Description=FMM Assistant Streamlit UI
+After=network-online.target fmm-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fmm
+Group=fmm
+WorkingDirectory=/opt/fmm-assistant
+EnvironmentFile=/etc/fmm-assistant/fmm.env
+Environment=API_BASE_URL=http://127.0.0.1:8000
+ExecStart=/opt/fmm-assistant/venv/bin/python -m streamlit run frontend/streamlit_app.py \
+    --server.address=127.0.0.1 --server.port=8501 --server.headless=true \
+    --browser.gatherUsageStats=false
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/fmm-assistant/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fmm-ui
+
+[Install]
+WantedBy=multi-user.target
