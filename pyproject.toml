@@ -18,7 +18,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "integration: requires a live PostgreSQL 16 instance with pgvector",
+    "integration: requires a live Databricks SQL workspace (legacy PG fixtures pending migration)",
 ]
 
 [tool.ruff]

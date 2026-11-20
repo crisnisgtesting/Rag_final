@@ -32,7 +32,7 @@ try:
     st.subheader("Readiness")
     st.json(health)
     if health.get("status") == "ready":
-        st.success("Database and pgvector are available.")
+        st.success("Databricks SQL is available.")
     else:
         st.warning("One or more dependencies are not ready.")
 except ApiError as exc:

@@ -6,11 +6,12 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from psycopg import AsyncConnection
 
 from app.api.deps import get_app_settings
 from app.auth.dependencies import CurrentUser, get_current_user, require_admin
 from app.config import Settings
+from app.db.compat import decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.ingestion import registry
 from app.ingestion.job_runner import start_job
@@ -21,10 +22,17 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
+def _decode_fields(row: Any, fields: set[str]) -> dict[str, Any]:
+    return {
+        key: decode_json_value(value) if key in fields else value
+        for key, value in dict(row).items()
+    }
+
+
 @router.get("")
 async def list_jobs(
     limit: int = Query(default=100, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     items = await registry.list_jobs(conn, limit=limit)
@@ -34,7 +42,7 @@ async def list_jobs(
 @router.get("/{job_id}")
 async def job_detail(
     job_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     job = await registry.job_detail(conn, job_id)
@@ -64,13 +72,19 @@ async def job_detail(
             (str(job_id),),
         )
     ).fetchall()
-    return {"job": job, "checkpoints": checkpoints, "vision_runs": runs}
+    return {
+        "job": job,
+        "checkpoints": [
+            _decode_fields(row, {"checkpoint_data"}) for row in checkpoints
+        ],
+        "vision_runs": [_decode_fields(row, {"error", "usage"}) for row in runs],
+    }
 
 
 @router.post("/{job_id}/cancel")
 async def cancel_job(
     job_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     job = await registry.request_cancel(conn, job_id, actor_user_id=user.id)
@@ -83,7 +97,7 @@ async def cancel_job(
 @router.post("/{job_id}/resume")
 async def resume_job(
     job_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:

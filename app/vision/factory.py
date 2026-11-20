@@ -68,15 +68,19 @@ def _gemini_configured(settings: Settings) -> bool:
 
 
 def _databricks_configured(settings: Settings) -> bool:
-    token = (
-        settings.databricks_token.get_secret_value()
-        if settings.databricks_token is not None
+    secret = (
+        settings.databricks_client_secret.get_secret_value()
+        if settings.databricks_client_secret is not None
         else ""
     )
+    endpoint = (settings.databricks_vision_endpoint or "").strip() or (
+        settings.databricks_model_serving_endpoint or ""
+    ).strip()
     return bool(
         (settings.databricks_host or "").strip()
-        and token.strip()
-        and (settings.databricks_vision_endpoint or "").strip()
+        and (settings.databricks_client_id or "").strip()
+        and secret.strip()
+        and endpoint
     )
 
 
@@ -110,13 +114,15 @@ def provider_summaries(
         },
         {
             "provider": "databricks",
-            "model": settings.databricks_vision_endpoint,
+            "model": (settings.databricks_vision_endpoint or "").strip()
+            or settings.databricks_model_serving_endpoint,
             "configured": _databricks_configured(settings),
             "is_active": active == "databricks",
             "endpoint": settings.databricks_host,
             "credential_configured": bool(
-                settings.databricks_token
-                and settings.databricks_token.get_secret_value()
+                settings.databricks_client_id
+                and settings.databricks_client_secret
+                and settings.databricks_client_secret.get_secret_value()
             ),
         },
     ]

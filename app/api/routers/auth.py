@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from psycopg import AsyncConnection
 
 from app.api.deps import get_app_settings
 from app.auth.dependencies import CurrentUser, get_current_user
@@ -11,6 +10,7 @@ from app.auth.rate_limit import SlidingWindowLimiter
 from app.auth.schemas import LoginRequest, TokenResponse, UserOut
 from app.auth.security import create_access_token
 from app.config import Settings
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.logging_conf import get_logger
 from app.services.auth_service import authenticate_user, get_user_with_roles
@@ -28,7 +28,7 @@ def _limiter(request: Request) -> SlidingWindowLimiter:
 async def login(
     payload: LoginRequest,
     request: Request,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     limiter: SlidingWindowLimiter = Depends(_limiter),
 ) -> TokenResponse:

@@ -5,14 +5,13 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import UUID
-
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
+from uuid import UUID, uuid4
 
 from app.auth.dependencies import CurrentUser
 from app.chat.provider import ChatProvider, build_chat_provider
 from app.config import Settings
+from app.db.compat import Jsonb, decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.logging_conf import get_logger
 from app.retrieval.embeddings import get_embedder
 from app.retrieval.search import RetrievedChunk, hybrid_search
@@ -100,7 +99,7 @@ def _retrieval_query(question: str, history: list[dict[str, str]]) -> str:
 
 
 async def answer_question(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     user: CurrentUser,
     *,
@@ -236,7 +235,7 @@ async def answer_question(
 
 
 async def stream_answer_events(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     user: CurrentUser,
     *,
@@ -292,7 +291,7 @@ async def stream_answer_events(
 
 
 async def _get_or_create_session(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     user_id: UUID,
     question: str,
     session_id: UUID | None,
@@ -309,15 +308,20 @@ async def _get_or_create_session(
         return row["id"], row["title"]
 
     title = question[:120]
+    session_uuid = uuid4()
     async with conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO chat_sessions
+                (id, user_id, title, created_at, updated_at)
+            VALUES (%s, %s, %s, current_timestamp(), current_timestamp())
+            """,
+            (str(session_uuid), str(user_id), title),
+        )
         row = await (
             await conn.execute(
-                """
-                INSERT INTO chat_sessions (user_id, title)
-                VALUES (%s, %s)
-                RETURNING id, title
-                """,
-                (str(user_id), title),
+                "SELECT id, title FROM chat_sessions WHERE id = %s",
+                (str(session_uuid),),
             )
         ).fetchone()
     await conn.commit()
@@ -325,7 +329,7 @@ async def _get_or_create_session(
 
 
 async def _load_history(
-    conn: AsyncConnection, session_id: UUID, limit: int
+    conn: DatabricksConnection, session_id: UUID, limit: int
 ) -> list[dict[str, str]]:
     rows = await (
         await conn.execute(
@@ -405,7 +409,7 @@ def _citations(chunks: list[RetrievedChunk]) -> list[dict[str, Any]]:
 
 
 async def _save_exchange(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     *,
     session_id: UUID,
     title: str | None,
@@ -423,77 +427,78 @@ async def _save_exchange(
     unanswered_reason: str | None = None,
     request_id: str | None = None,
 ) -> dict[str, Any]:
+    user_message_id = uuid4()
+    assistant_message_id = uuid4()
+    response_id = uuid4()
     async with conn.transaction():
-        user_message = await (
-            await conn.execute(
-                """
-                INSERT INTO chat_messages (session_id, role, content)
-                VALUES (%s, 'user', %s)
-                RETURNING id
-                """,
-                (str(session_id), question),
-            )
-        ).fetchone()
-        assistant_message = await (
-            await conn.execute(
-                """
-                INSERT INTO chat_messages
-                    (session_id, role, content, citations, retrieval, provider,
-                     model, token_usage, latency_ms)
-                VALUES (%s, 'assistant', %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    str(session_id),
-                    answer,
-                    Jsonb(citations),
-                    Jsonb(retrieval),
-                    provider,
-                    model,
-                    Jsonb(usage),
-                    latency_ms,
-                ),
-            )
-        ).fetchone()
-        response = await (
-            await conn.execute(
-                """
-                INSERT INTO chat_responses
-                    (session_id, user_id, user_message_id, assistant_message_id,
-                     question, answer, language, provider, model, retrieval,
-                     token_usage, latency_ms, citation_status, request_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    str(session_id),
-                    str(user_id),
-                    str(user_message["id"]),
-                    str(assistant_message["id"]),
-                    question,
-                    answer,
-                    language,
-                    provider,
-                    model,
-                    Jsonb(retrieval),
-                    Jsonb(usage),
-                    latency_ms,
-                    citation_status,
-                    request_id,
-                ),
-            )
-        ).fetchone()
+        await conn.execute(
+            """
+            INSERT INTO chat_messages
+                (id, session_id, role, content, created_at)
+            VALUES (%s, %s, 'user', %s, current_timestamp())
+            """,
+            (str(user_message_id), str(session_id), question),
+        )
+        await conn.execute(
+            """
+            INSERT INTO chat_messages
+                (id, session_id, role, content, citations, retrieval, provider,
+                 model, token_usage, latency_ms, created_at)
+            VALUES (%s, %s, 'assistant', %s, %s, %s, %s, %s, %s, %s,
+                    current_timestamp())
+            """,
+            (
+                str(assistant_message_id),
+                str(session_id),
+                answer,
+                Jsonb(citations),
+                Jsonb(retrieval),
+                provider,
+                model,
+                Jsonb(usage),
+                latency_ms,
+            ),
+        )
+        await conn.execute(
+            """
+            INSERT INTO chat_responses
+                (id, session_id, user_id, user_message_id, assistant_message_id,
+                 question, answer, language, provider, model, retrieval,
+                 token_usage, latency_ms, citation_status, request_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    current_timestamp())
+            """,
+            (
+                str(response_id),
+                str(session_id),
+                str(user_id),
+                str(user_message_id),
+                str(assistant_message_id),
+                question,
+                answer,
+                language,
+                provider,
+                model,
+                Jsonb(retrieval),
+                Jsonb(usage),
+                latency_ms,
+                citation_status,
+                request_id,
+            ),
+        )
         for citation in citations:
             await conn.execute(
                 """
                 INSERT INTO response_sources
-                    (response_id, citation_index, source_kind, chunk_id,
+                    (id, response_id, citation_index, source_kind, chunk_id,
                      document_id, version_id, page_start, page_end, section_number,
-                     heading, excerpt, score, metadata)
-                VALUES (%s, %s, 'chunk', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     heading, excerpt, score, metadata, created_at)
+                VALUES (%s, %s, %s, 'chunk', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, current_timestamp())
                 """,
                 (
-                    str(response["id"]),
+                    str(uuid4()),
+                    str(response_id),
                     int(citation["index"]),
                     citation.get("chunk_id"),
                     citation.get("document_id"),
@@ -509,21 +514,23 @@ async def _save_exchange(
             )
         await conn.execute(
             "UPDATE chat_sessions SET title = coalesce(title, %s), language = %s, "
-            "updated_at = now() WHERE id = %s",
+            "updated_at = current_timestamp() WHERE id = %s",
             (title, language, str(session_id)),
         )
         if unanswered_reason:
             await conn.execute(
                 """
                 INSERT INTO unanswered_questions
-                    (user_id, session_id, response_id, question, language, reason,
-                     retrieval)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (id, user_id, session_id, response_id, question, language, reason,
+                     retrieval, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open',
+                        current_timestamp(), current_timestamp())
                 """,
                 (
+                    str(uuid4()),
                     str(user_id),
                     str(session_id),
-                    str(response["id"]),
+                    str(response_id),
                     question,
                     language,
                     unanswered_reason,
@@ -533,9 +540,9 @@ async def _save_exchange(
     await conn.commit()
     return {
         "session_id": str(session_id),
-        "message_id": str(assistant_message["id"]),
-        "response_id": str(response["id"]),
-        "user_message_id": str(user_message["id"]),
+        "message_id": str(assistant_message_id),
+        "response_id": str(response_id),
+        "user_message_id": str(user_message_id),
         "answer": answer,
         "citations": citations,
         "provider": provider,
@@ -548,17 +555,17 @@ async def _save_exchange(
 
 
 async def list_sessions(
-    conn: AsyncConnection, user_id: UUID, *, limit: int = 50
+    conn: DatabricksConnection, user_id: UUID, *, limit: int = 50
 ) -> list[dict[str, Any]]:
     return await (
         await conn.execute(
             """
             SELECT s.id, s.title, s.created_at, s.updated_at,
-                   count(m.id) FILTER (WHERE m.role = 'assistant') AS answer_count
+                   sum(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) AS answer_count
             FROM chat_sessions s
             LEFT JOIN chat_messages m ON m.session_id = s.id
             WHERE s.user_id = %s
-            GROUP BY s.id
+            GROUP BY s.id, s.title, s.created_at, s.updated_at
             ORDER BY s.updated_at DESC
             LIMIT %s
             """,
@@ -568,7 +575,7 @@ async def list_sessions(
 
 
 async def session_detail(
-    conn: AsyncConnection, user_id: UUID, session_id: UUID
+    conn: DatabricksConnection, user_id: UUID, session_id: UUID
 ) -> dict[str, Any] | None:
     session = await (
         await conn.execute(
@@ -595,11 +602,18 @@ async def session_detail(
             (str(session_id),),
         )
     ).fetchall()
-    return {"session": session, "messages": messages}
+    decoded_messages = []
+    for message in messages:
+        item = dict(message)
+        for field in ("citations", "retrieval", "token_usage"):
+            if field in item:
+                item[field] = decode_json_value(item[field])
+        decoded_messages.append(item)
+    return {"session": session, "messages": decoded_messages}
 
 
 async def submit_feedback(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     *,
     user_id: UUID,
     response_id: UUID,
@@ -616,19 +630,37 @@ async def submit_feedback(
     ).fetchone()
     if response is None:
         raise ChatServiceError("Response was not found")
+    feedback_id = uuid4()
     async with conn.transaction():
+        await conn.execute(
+            """
+            MERGE INTO feedback AS target
+            USING (
+                SELECT %s AS response_id, %s AS user_id, %s AS rating, %s AS comment
+            ) AS source
+            ON target.response_id = source.response_id
+               AND target.user_id = source.user_id
+            WHEN MATCHED THEN UPDATE SET
+                rating = source.rating,
+                comment = source.comment,
+                updated_at = current_timestamp()
+            WHEN NOT MATCHED THEN INSERT
+                (id, response_id, user_id, rating, comment, created_at, updated_at)
+                VALUES (%s, source.response_id, source.user_id, source.rating,
+                        source.comment, current_timestamp(), current_timestamp())
+            """,
+            (
+                str(response_id),
+                str(user_id),
+                rating,
+                comment,
+                str(feedback_id),
+            ),
+        )
         row = await (
             await conn.execute(
-                """
-                INSERT INTO feedback (response_id, user_id, rating, comment)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (response_id, user_id) DO UPDATE
-                    SET rating = EXCLUDED.rating,
-                        comment = EXCLUDED.comment,
-                        updated_at = now()
-                RETURNING *
-                """,
-                (str(response_id), str(user_id), rating, comment),
+                "SELECT * FROM feedback WHERE response_id = %s AND user_id = %s",
+                (str(response_id), str(user_id)),
             )
         ).fetchone()
     await conn.commit()
@@ -636,7 +668,7 @@ async def submit_feedback(
 
 
 async def list_unanswered(
-    conn: AsyncConnection, *, status: str = "open", limit: int = 100
+    conn: DatabricksConnection, *, status: str = "open", limit: int = 100
 ) -> list[dict[str, Any]]:
     return await (
         await conn.execute(
@@ -654,7 +686,7 @@ async def list_unanswered(
 
 
 async def resolve_unanswered(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     question_id: UUID,
     *,
     status: str,
@@ -663,18 +695,22 @@ async def resolve_unanswered(
 ) -> dict[str, Any]:
     if status not in {"open", "in_review", "resolved", "ignored"}:
         raise ChatServiceError("Invalid unanswered question status")
+    await conn.execute(
+        """
+        UPDATE unanswered_questions
+        SET status = %s, resolution = %s,
+            resolved_at = CASE WHEN %s IN ('resolved', 'ignored')
+                          THEN current_timestamp() ELSE NULL END,
+            resolved_by = %s,
+            updated_at = current_timestamp()
+        WHERE id = %s
+        """,
+        (status, resolution, status, str(user_id), str(question_id)),
+    )
     row = await (
         await conn.execute(
-            """
-            UPDATE unanswered_questions
-            SET status = %s, resolution = %s,
-                resolved_at = CASE WHEN %s IN ('resolved', 'ignored')
-                              THEN now() ELSE NULL END,
-                resolved_by = %s
-            WHERE id = %s
-            RETURNING *
-            """,
-            (status, resolution, status, str(user_id), str(question_id)),
+            "SELECT * FROM unanswered_questions WHERE id = %s",
+            (str(question_id),),
         )
     ).fetchone()
     if row is None:
@@ -684,7 +720,7 @@ async def resolve_unanswered(
 
 
 async def response_feedback(
-    conn: AsyncConnection, user_id: UUID, *, limit: int = 100
+    conn: DatabricksConnection, user_id: UUID, *, limit: int = 100
 ) -> list[dict[str, Any]]:
     return await (
         await conn.execute(

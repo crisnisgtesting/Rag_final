@@ -7,10 +7,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
-from psycopg import AsyncConnection
 from pydantic import BaseModel, Field
 
 from app.auth.dependencies import CurrentUser, get_current_user, require_admin
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.ingestion import registry
 from app.knowledge import service
@@ -36,7 +36,7 @@ class CorrectionRequest(BaseModel):
 @router.get("/summary")
 async def summary(
     version_id: UUID | None = None,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     return await service.knowledge_summary(conn, version_id=version_id)
@@ -47,7 +47,7 @@ async def workflows(
     version_id: UUID | None = None,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     items = await service.list_workflows(
@@ -59,7 +59,7 @@ async def workflows(
 @router.get("/workflows/{workflow_id}")
 async def workflow_detail(
     workflow_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     detail = await service.workflow_detail(conn, workflow_id)
@@ -71,7 +71,7 @@ async def workflow_detail(
 @router.get("/workflows/{workflow_id}/export", response_class=PlainTextResponse)
 async def export_workflow(
     workflow_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> str:
     markdown = await service.export_workflow_markdown(conn, workflow_id)
@@ -84,7 +84,7 @@ async def export_workflow(
 async def correct_workflow(
     workflow_id: UUID,
     payload: CorrectionRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:
@@ -106,7 +106,7 @@ async def correct_workflow(
 async def workflow_status(
     workflow_id: UUID,
     payload: StatusRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:
@@ -128,7 +128,7 @@ async def workflow_status(
 async def rebuild(
     version_id: UUID,
     approve: bool = Query(default=False),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:
@@ -148,7 +148,7 @@ async def rebuild(
 @router.post("/versions/{version_id}/approve")
 async def approve(
     version_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     version = await registry.version_context(conn, version_id)
@@ -165,7 +165,7 @@ async def approve(
 async def conflicts(
     status: str = Query(default="open"),
     limit: int = Query(default=100, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     return {"items": await service.list_conflicts(conn, status=status, limit=limit)}
@@ -175,7 +175,7 @@ async def conflicts(
 async def resolve(
     conflict_id: UUID,
     payload: ResolutionRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:

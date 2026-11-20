@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from uuid import UUID
 
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
-
+from app.db.compat import Jsonb
+from app.db.databricks import DatabricksConnection
 from app.logging_conf import get_logger
 
 logger = get_logger(__name__)
 
 
 async def record_audit(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     *,
     actor_user_id: UUID | str | None,
     action: str,
@@ -27,10 +27,12 @@ async def record_audit(
         await conn.execute(
             """
             INSERT INTO audit_log
-                (actor_user_id, action, entity_type, entity_id, request_id, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (id, actor_user_id, action, entity_type, entity_id, request_id,
+                 metadata, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, current_timestamp())
             """,
             (
+                time.time_ns(),
                 str(actor_user_id) if actor_user_id else None,
                 action,
                 entity_type,

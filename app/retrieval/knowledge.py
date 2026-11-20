@@ -11,8 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from psycopg import AsyncConnection
-
+from app.db.databricks import DatabricksConnection
 from app.logging_conf import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +46,10 @@ _STOP_WORDS = {
 _MIN_TOKEN_LENGTH = 4
 
 
+def _like_any(column: str, count: int) -> str:
+    return " OR ".join([f"lower({column}) LIKE %s"] * count)
+
+
 def query_tokens(query: str, *, limit: int = 8) -> list[str]:
     tokens = [
         token
@@ -57,7 +60,7 @@ def query_tokens(query: str, *, limit: int = 8) -> list[str]:
 
 
 async def matched_knowledge(
-    conn: AsyncConnection, query: str, *, limit: int = 25
+    conn: DatabricksConnection, query: str, *, limit: int = 25
 ) -> list[dict[str, Any]]:
     """Return the approved knowledge items that match the query tokens."""
     tokens = query_tokens(query)
@@ -67,25 +70,25 @@ async def matched_knowledge(
     patterns = [f"%{token}%" for token in tokens]
     rows = await (
         await conn.execute(
-            """
+            f"""
             SELECT 'entity' AS knowledge_type, e.id, e.name AS label,
                    e.description, e.normalized_name AS match_key
             FROM knowledge_entities e
             WHERE e.status = 'approved'
-              AND e.normalized_name ILIKE ANY(%s)
+              AND ({_like_any('e.normalized_name', len(patterns))})
             UNION ALL
             SELECT 'workflow', w.id, w.title, w.summary, w.normalized_title
             FROM workflows w
             WHERE w.status = 'approved'
-              AND w.normalized_title ILIKE ANY(%s)
+              AND ({_like_any('w.normalized_title', len(patterns))})
             UNION ALL
             SELECT 'rule', r.id, r.rule_type, r.rule_text, lower(r.rule_text)
             FROM knowledge_rules r
             WHERE r.status = 'approved'
-              AND r.rule_text ILIKE ANY(%s)
+              AND ({_like_any('r.rule_text', len(patterns))})
             LIMIT %s
             """,
-            (patterns, patterns, patterns, limit),
+            (*patterns, *patterns, *patterns, limit),
         )
     ).fetchall()
 
@@ -111,7 +114,7 @@ async def matched_knowledge(
 
 
 async def knowledge_chunk_boosts(
-    conn: AsyncConnection, query: str, *, limit: int = 25
+    conn: DatabricksConnection, query: str, *, limit: int = 25
 ) -> dict[str, float]:
     """Map chunk ids to a boost value based on matched knowledge sources."""
     matched = await matched_knowledge(conn, query, limit=limit)
@@ -139,7 +142,7 @@ async def knowledge_chunk_boosts(
 
 
 async def knowledge_summary_for_query(
-    conn: AsyncConnection, query: str, *, limit: int = 10
+    conn: DatabricksConnection, query: str, *, limit: int = 10
 ) -> list[dict[str, Any]]:
     """Compact knowledge view used to enrich retrieval metadata."""
     matched = await matched_knowledge(conn, query, limit=limit)

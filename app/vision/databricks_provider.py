@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from app.config import Settings
+from app.llm.auth.oauth import DatabricksOAuthTokenProvider
 from app.vision.base import VisionConfigurationError, VisionProvider, VisionResponseError
 from app.vision.http import request_with_retry
 from app.vision.image_utils import image_data_url
@@ -24,17 +25,21 @@ class DatabricksVisionProvider(VisionProvider):
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
-        token = (
-            settings.databricks_token.get_secret_value()
-            if settings.databricks_token is not None
+        client_secret = (
+            settings.databricks_client_secret.get_secret_value()
+            if settings.databricks_client_secret is not None
             else ""
         )
+        endpoint = (settings.databricks_vision_endpoint or "").strip() or (
+            settings.databricks_model_serving_endpoint or ""
+        ).strip()
         missing = [
             name
             for name, value in (
                 ("DATABRICKS_HOST", settings.databricks_host),
-                ("DATABRICKS_TOKEN", token),
-                ("DATABRICKS_VISION_ENDPOINT", settings.databricks_vision_endpoint),
+                ("DATABRICKS_CLIENT_ID", settings.databricks_client_id),
+                ("DATABRICKS_CLIENT_SECRET", client_secret),
+                ("DATABRICKS_MODEL_SERVING_ENDPOINT", endpoint),
             )
             if not (value or "").strip()
         ]
@@ -49,21 +54,37 @@ class DatabricksVisionProvider(VisionProvider):
                 "Databricks Model Serving vision endpoints",
                 provider=self.provider_name,
             )
+        assert settings.databricks_host is not None
+        assert settings.databricks_client_id is not None
+        self._oauth = DatabricksOAuthTokenProvider(
+            host=settings.databricks_host,
+            client_id=settings.databricks_client_id,
+            client_secret=client_secret,
+            scope=settings.databricks_oauth_scope,
+            timeout_seconds=settings.vision_timeout_seconds,
+        )
 
     @property
     def model_name(self) -> str:
-        return self.settings.databricks_vision_endpoint or ""
+        return (self.settings.databricks_vision_endpoint or "").strip() or (
+            self.settings.databricks_model_serving_endpoint or ""
+        )
+
+    @property
+    def _endpoint(self) -> str:
+        return (self.settings.databricks_vision_endpoint or "").strip() or (
+            self.settings.databricks_model_serving_endpoint or ""
+        )
 
     @property
     def _host(self) -> str:
         assert self.settings.databricks_host is not None
         return self.settings.databricks_host.rstrip("/")
 
-    def _headers(self) -> dict[str, str]:
-        assert self.settings.databricks_token is not None
+    async def _headers(self) -> dict[str, str]:
         return {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.settings.databricks_token.get_secret_value()}",
+            "Authorization": await self._oauth.authorization_header(),
         }
 
     async def analyze_page(
@@ -96,11 +117,7 @@ class DatabricksVisionProvider(VisionProvider):
             "temperature": 0.1,
             "max_tokens": self.settings.vision_max_output_tokens,
         }
-        assert self.settings.databricks_vision_endpoint is not None
-        url = (
-            f"{self._host}/serving-endpoints/"
-            f"{self.settings.databricks_vision_endpoint}/invocations"
-        )
+        url = f"{self._host}/serving-endpoints/{self._endpoint}/invocations"
         started = time.perf_counter()
         response = await request_with_retry(
             method="POST",
@@ -108,7 +125,7 @@ class DatabricksVisionProvider(VisionProvider):
             provider=self.provider_name,
             timeout=self.settings.vision_timeout_seconds,
             max_retries=self.settings.vision_max_retries,
-            headers=self._headers(),
+            headers=await self._headers(),
             json_body=payload,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -176,11 +193,7 @@ class DatabricksVisionProvider(VisionProvider):
 
     async def healthcheck(self) -> ProviderHealth:
         started = time.perf_counter()
-        assert self.settings.databricks_vision_endpoint is not None
-        url = (
-            f"{self._host}/api/2.0/serving-endpoints/"
-            f"{self.settings.databricks_vision_endpoint}"
-        )
+        url = f"{self._host}/api/2.0/serving-endpoints/{self._endpoint}"
         try:
             response = await request_with_retry(
                 method="GET",
@@ -188,7 +201,7 @@ class DatabricksVisionProvider(VisionProvider):
                 provider=self.provider_name,
                 timeout=min(self.settings.vision_timeout_seconds, 15.0),
                 max_retries=0,
-                headers=self._headers(),
+                headers=await self._headers(),
             )
         except Exception as exc:  # noqa: BLE001
             return ProviderHealth(

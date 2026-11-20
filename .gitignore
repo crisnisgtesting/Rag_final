@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+
 *.py[cod]
 *.egg-info/
 .venv/
@@ -25,6 +26,7 @@ config/.env
 backups/
 
 # Runtime data
+/tests/
 data/documents/*
 !data/documents/.gitkeep
 data/document_versions/*

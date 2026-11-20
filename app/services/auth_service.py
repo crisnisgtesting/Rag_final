@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
-
-from psycopg import AsyncConnection
+from uuid import UUID, uuid4
 
 from app.auth.security import hash_password, verify_password
+from app.db.databricks import DatabricksConnection
 
 MIN_PASSWORD_LENGTH = 8
 _DUMMY_PASSWORD_HASH = hash_password("timing-equalization-dummy-password")
@@ -25,7 +24,7 @@ def _validate_password(password: str) -> None:
 
 
 async def get_user_by_username(
-    conn: AsyncConnection, username: str
+    conn: DatabricksConnection, username: str
 ) -> dict[str, Any] | None:
     return await (
         await conn.execute(
@@ -40,7 +39,7 @@ async def get_user_by_username(
 
 
 async def authenticate_user(
-    conn: AsyncConnection, username: str, password: str
+    conn: DatabricksConnection, username: str, password: str
 ) -> dict[str, Any] | None:
     user = await get_user_by_username(conn, username)
     password_hash = user["password_hash"] if user is not None else _DUMMY_PASSWORD_HASH
@@ -49,34 +48,42 @@ async def authenticate_user(
         return None
     async with conn.transaction():
         await conn.execute(
-            "UPDATE users SET last_login_at = now() WHERE id = %s", (str(user["id"]),)
+            "UPDATE users SET last_login_at = current_timestamp() WHERE id = %s",
+            (str(user["id"]),),
         )
     return user
 
 
 async def get_user_with_roles(
-    conn: AsyncConnection, user_id: UUID
+    conn: DatabricksConnection, user_id: UUID
 ) -> dict[str, Any] | None:
-    return await (
+    row = await (
         await conn.execute(
             """
             SELECT u.id, u.username, u.email, u.full_name, u.is_active,
-                   COALESCE(
-                       array_agg(ur.role_code) FILTER (WHERE ur.role_code IS NOT NULL),
-                       '{}'
-                   ) AS roles
+                   COALESCE(collect_set(ur.role_code), array()) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = %s
-            GROUP BY u.id
+            GROUP BY u.id, u.username, u.email, u.full_name, u.is_active
             """,
             (str(user_id),),
         )
     ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": UUID(str(row["id"])),
+        "username": row["username"],
+        "email": row["email"],
+        "full_name": row["full_name"],
+        "is_active": row["is_active"],
+        "roles": list(row["roles"] or []),
+    }
 
 
 async def create_user(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     *,
     username: str,
     password: str,
@@ -100,9 +107,11 @@ async def create_user(
         if existing is not None:
             raise UserServiceError(f"User '{username}' already exists")
 
+        role_placeholders = ", ".join(["%s"] * len(roles))
         role_rows = await (
             await conn.execute(
-                "SELECT role_code FROM roles WHERE role_code = ANY(%s)", (roles,)
+                f"SELECT role_code FROM roles WHERE role_code IN ({role_placeholders})",
+                tuple(roles),
             )
         ).fetchall()
         known = {row["role_code"] for row in role_rows}
@@ -110,18 +119,23 @@ async def create_user(
         if unknown:
             raise UserServiceError(f"Unknown roles: {', '.join(sorted(unknown))}")
 
-        row = await (
-            await conn.execute(
-                """
-                INSERT INTO users (username, email, full_name, password_hash, is_active)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (username, email, full_name, hash_password(password), is_active),
-            )
-        ).fetchone()
-        assert row is not None
-        user_id: UUID = row["id"]
+        user_id = uuid4()
+        await conn.execute(
+            """
+            INSERT INTO users
+                (id, username, email, full_name, password_hash, is_active,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, current_timestamp(), current_timestamp())
+            """,
+            (
+                str(user_id),
+                username,
+                email,
+                full_name,
+                hash_password(password),
+                is_active,
+            ),
+        )
         for role in roles:
             await conn.execute(
                 "INSERT INTO user_roles (user_id, role_code) VALUES (%s, %s)",
@@ -131,7 +145,7 @@ async def create_user(
 
 
 async def change_password(
-    conn: AsyncConnection, *, user_id: UUID, new_password: str
+    conn: DatabricksConnection, *, user_id: UUID, new_password: str
 ) -> None:
     _validate_password(new_password)
     async with conn.transaction():

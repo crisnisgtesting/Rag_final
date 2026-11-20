@@ -1,32 +1,40 @@
-"""Non-secret application settings stored in PostgreSQL.
+"""Non-secret application settings stored in Databricks Delta.
 
 Secrets (API keys, PATs, database credentials) are never stored here.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from uuid import UUID
 
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
-
 from app.config import Settings
+from app.db.compat import Jsonb
+from app.db.databricks import DatabricksConnection
 from app.services.audit import record_audit
 from app.vision.factory import ALLOWED_PROVIDERS, normalize_provider_name, provider_summaries
 
 VISION_PROVIDER_KEY = "vision.provider"
 
 
-async def get_setting(conn: AsyncConnection, key: str) -> Any | None:
+async def get_setting(conn: DatabricksConnection, key: str) -> Any | None:
     row = await (
         await conn.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
     ).fetchone()
-    return row["value"] if row else None
+    if row is None:
+        return None
+    value = row["value"]
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 
 async def set_setting(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     key: str,
     value: Any,
     *,
@@ -35,12 +43,19 @@ async def set_setting(
     async with conn.transaction():
         await conn.execute(
             """
-            INSERT INTO app_settings (key, value, updated_by, updated_at)
-            VALUES (%s, %s, %s, now())
-            ON CONFLICT (key) DO UPDATE
-                SET value = EXCLUDED.value,
-                    updated_by = EXCLUDED.updated_by,
-                    updated_at = now()
+            MERGE INTO app_settings AS target
+            USING (
+                SELECT %s AS `key`, %s AS `value`, %s AS `updated_by`,
+                       current_timestamp() AS `updated_at`
+            ) AS source
+            ON target.`key` = source.`key`
+            WHEN MATCHED THEN UPDATE SET
+                `value` = source.`value`,
+                `updated_by` = source.`updated_by`,
+                `updated_at` = source.`updated_at`
+            WHEN NOT MATCHED THEN INSERT (`key`, `value`, `updated_by`, `updated_at`)
+                VALUES (source.`key`, source.`value`, source.`updated_by`,
+                        source.`updated_at`)
             """,
             (key, Jsonb(value), str(actor_user_id) if actor_user_id else None),
         )
@@ -55,7 +70,7 @@ async def set_setting(
 
 
 async def get_effective_vision_provider(
-    conn: AsyncConnection, settings: Settings
+    conn: DatabricksConnection, settings: Settings
 ) -> tuple[str, str]:
     """Return (provider_name, source) where source is 'database' or 'environment'."""
     value = await get_setting(conn, VISION_PROVIDER_KEY)
@@ -67,7 +82,7 @@ async def get_effective_vision_provider(
 
 
 async def set_vision_provider(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     provider: str,
     *,
     actor_user_id: UUID | None = None,
@@ -83,7 +98,7 @@ async def set_vision_provider(
 
 
 async def get_vision_configuration(
-    conn: AsyncConnection, settings: Settings
+    conn: DatabricksConnection, settings: Settings
 ) -> dict[str, Any]:
     active, source = await get_effective_vision_provider(conn, settings)
     return {

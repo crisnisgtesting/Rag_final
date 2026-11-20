@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_app_settings
 from app.auth.dependencies import CurrentUser, require_admin
 from app.config import Settings
+from app.db.compat import Jsonb
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.evaluation.service import (
     create_eval_case,
@@ -33,6 +35,23 @@ from app.voice.transcribe import transcription_health
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+def _decode_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _decode_row(row: dict[str, Any], *fields: str) -> dict[str, Any]:
+    decoded = dict(row)
+    for field in fields:
+        if field in decoded:
+            decoded[field] = _decode_json_value(decoded[field])
+    return decoded
 
 
 class ProviderSummary(BaseModel):
@@ -99,7 +118,7 @@ def _model_for(provider: str, settings: Settings) -> str:
 
 @router.get("/vision/providers", response_model=VisionConfiguration)
 async def list_vision_providers(
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     _: CurrentUser = Depends(require_admin),
 ) -> VisionConfiguration:
@@ -111,7 +130,7 @@ async def list_vision_providers(
 async def update_vision_provider(
     payload: SetVisionProviderRequest,
     request: Request,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> VisionConfiguration:
@@ -139,7 +158,7 @@ async def update_vision_provider(
 @router.post("/vision/test", response_model=ProviderHealth)
 async def test_vision_provider(
     payload: ProviderTestRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     _: CurrentUser = Depends(require_admin),
 ) -> ProviderHealth:
@@ -201,7 +220,7 @@ async def test_vision_provider(
 async def audit_log(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     rows = await (
@@ -216,13 +235,17 @@ async def audit_log(
             (limit, offset),
         )
     ).fetchall()
-    return {"items": rows, "limit": limit, "offset": offset}
+    return {
+        "items": [_decode_row(row, "metadata") for row in rows],
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/evals")
 async def eval_cases(
     active_only: bool = Query(default=True),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     return {"items": await list_eval_set(conn, active_only=active_only)}
@@ -231,7 +254,7 @@ async def eval_cases(
 @router.post("/evals", status_code=status.HTTP_201_CREATED)
 async def add_eval_case(
     payload: EvalCaseRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     return await create_eval_case(
@@ -250,7 +273,7 @@ async def add_eval_case(
 @router.post("/evals/run")
 async def execute_eval(
     payload: EvalRunRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -266,7 +289,7 @@ async def execute_eval(
 @router.get("/evals/results")
 async def eval_results(
     limit: int = Query(default=200, ge=1, le=1000),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     return {"items": await latest_eval_results(conn, limit=limit)}
@@ -275,20 +298,21 @@ async def eval_results(
 @router.post("/vision/evaluations", status_code=status.HTTP_201_CREATED)
 async def add_vision_evaluation(
     payload: VisionEvaluationRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
-    row = await (
+    evaluation_id = str(uuid4())
+    async with conn.transaction():
         await conn.execute(
             """
             INSERT INTO vision_evaluations
-                (document_version_id, document_page_id, provider, model,
+                (id, document_version_id, document_page_id, provider, model,
                  evaluation_type, accuracy_score, completeness_score, visual_score,
-                 metrics, notes, created_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING *
+                 metrics, notes, created_by, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, current_timestamp())
             """,
             (
+                evaluation_id,
                 payload.document_version_id,
                 payload.document_page_id,
                 payload.provider,
@@ -302,14 +326,17 @@ async def add_vision_evaluation(
                 str(user.id),
             ),
         )
+    row = await (
+        await conn.execute(
+            "SELECT * FROM vision_evaluations WHERE id = %s", (evaluation_id,)
+        )
     ).fetchone()
-    await conn.commit()
-    return row
+    return _decode_row(row, "metrics") if row is not None else {}
 
 
 @router.get("/operations/health")
 async def operations_health(
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     _: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -324,10 +351,12 @@ async def operations_health(
                 (SELECT count(*) FROM document_chunks WHERE embedding IS NULL) AS missing_embeddings,
                 (SELECT count(*) FROM knowledge_conflicts WHERE status = 'open') AS open_conflicts,
                 (SELECT count(*) FROM unanswered_questions WHERE status = 'open') AS open_questions,
-                (SELECT count(*) FROM request_logs WHERE created_at > now() - interval '1 hour')
+                (SELECT count(*) FROM request_logs
+                 WHERE created_at > current_timestamp() - INTERVAL 1 HOUR)
                     AS requests_last_hour,
                 (SELECT count(*) FROM request_logs
-                 WHERE created_at > now() - interval '1 hour' AND status_code >= 500)
+                 WHERE created_at > current_timestamp() - INTERVAL 1 HOUR
+                   AND status_code >= 500)
                     AS errors_last_hour
             """
         )

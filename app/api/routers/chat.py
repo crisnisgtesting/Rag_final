@@ -8,7 +8,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from psycopg import AsyncConnection
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_app_settings
@@ -25,6 +24,7 @@ from app.chat.service import (
     submit_feedback,
 )
 from app.config import Settings
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.retrieval.embeddings import EmbeddingError
 from app.retrieval.search import RetrievalError
@@ -60,7 +60,7 @@ class UnansweredResolution(BaseModel):
 @router.post("")
 async def chat(
     payload: ChatRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -92,7 +92,7 @@ async def chat(
 async def chat_stream(
     payload: ChatRequest,
     request: Request,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(get_current_user),
 ) -> StreamingResponse:
@@ -137,7 +137,7 @@ async def chat_stream(
 async def feedback(
     response_id: UUID,
     payload: FeedbackRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
@@ -158,7 +158,7 @@ async def feedback(
 async def unanswered(
     status: str = Query(default="open"),
     limit: int = Query(default=100, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     return {"items": await list_unanswered(conn, status=status, limit=limit)}
@@ -168,7 +168,7 @@ async def unanswered(
 async def resolve_question(
     question_id: UUID,
     payload: UnansweredResolution,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:
@@ -213,7 +213,7 @@ async def transcribe(
 @router.get("/sessions")
 async def get_sessions(
     limit: int = Query(default=50, ge=1, le=200),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     return {"items": await list_sessions(conn, user.id, limit=limit)}
@@ -222,7 +222,7 @@ async def get_sessions(
 @router.get("/sessions/{session_id}")
 async def get_session(
     session_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     detail = await session_detail(conn, user.id, session_id)

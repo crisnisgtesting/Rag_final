@@ -1,7 +1,7 @@
 """Application configuration.
 
 All runtime configuration is environment based. Production secrets are never
-persisted to the database and never returned through the API.
+persisted to application storage and never returned through the API.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -54,8 +54,6 @@ class Settings(BaseSettings):
     )
     max_upload_mb: int = 200
 
-    database_url: str = "postgresql://postgres@127.0.0.1:55432/fmm_dev"
-
     jwt_secret: SecretStr = SecretStr("dev-only-insecure-change-me")
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 480
@@ -63,7 +61,7 @@ class Settings(BaseSettings):
     auth_login_window_seconds: int = 300
 
     # Vision provider selection (database override applies to new jobs only)
-    vision_provider: VisionProviderName = "qwen"
+    vision_provider: VisionProviderName = "databricks"
 
     qwen_vision_base_url: str = "http://127.0.0.1:8001/v1"
     qwen_vision_model: str = "Qwen3-VL-8B-Instruct"
@@ -74,9 +72,31 @@ class Settings(BaseSettings):
     gemini_api_base_url: str = "https://generativelanguage.googleapis.com"
 
     databricks_host: str | None = None
-    databricks_token: SecretStr | None = None
+    databricks_client_id: str | None = None
+    databricks_client_secret: SecretStr | None = None
+    databricks_oauth_scope: str = "model-serving"
+    databricks_model_serving_endpoint: str = "databri-meta--instruct"
+    databricks_model_timeout_seconds: float = 300.0
+    databricks_model_max_retries: int = 2
+    databricks_model_supports_parameters: bool = False
     databricks_vision_endpoint: str | None = None
     databricks_vision_payload_style: Literal["openai_chat"] = "openai_chat"
+    databricks_vector_search_endpoint: str | None = None
+    databricks_vector_search_index: str | None = None
+    databricks_ai_search_oauth_scope: str = "ai-search"
+    databricks_files_oauth_scope: str = "files"
+    databricks_files_client_secret: SecretStr | None = None
+    databricks_catalog: str = "prod_operations"
+    databricks_schema: str = "rag"
+    databricks_volume_path: str = "/Volumes/prod_operations/rag/rag_documents"
+    databricks_sql_http_path: str | None = None
+    databricks_sql_oauth_scope: str = "sql"
+    databricks_sql_max_connections: int = 8
+    databricks_bootstrap_on_startup: bool = True
+    databricks_sql_client_secret: SecretStr | None = None
+    databricks_uc_client_secret: SecretStr | None = None
+    databricks_jobs_client_secret: SecretStr | None = None
+    databricks_ai_search_client_secret: SecretStr | None = None
 
     vision_timeout_seconds: float = 120.0
     vision_max_retries: int = 3
@@ -92,7 +112,12 @@ class Settings(BaseSettings):
 
     # Phase 2 - ingestion
     embedding_model: str = "BAAI/bge-m3"
-    embedding_dim: int = 1024
+    embedding_dimension: int = Field(
+        default=1024,
+        validation_alias=AliasChoices(
+            "embedding_dimension", "EMBEDDING_DIMENSION", "EMBEDDING_DIM"
+        ),
+    )
     embedding_device: str = "cpu"
     embedding_batch_size: int = 16
     embedding_max_seq_length: int = 1024
@@ -127,7 +152,7 @@ class Settings(BaseSettings):
     retrieval_reranker_max_length: int = 512
 
     # Phase 2 - grounded chat
-    chat_provider: Literal["gemini", "qwen", "databricks"] = "gemini"
+    chat_provider: Literal["gemini", "qwen", "databricks"] = "databricks"
     gemini_chat_model: str | None = None
     chat_temperature: float = 0.2
     chat_max_output_tokens: int = 2048
@@ -152,16 +177,29 @@ class Settings(BaseSettings):
     @field_validator(
         "qwen_vision_api_key",
         "gemini_api_key",
-        "databricks_token",
-        "gemini_vision_model",
-        "gemini_chat_model",
+        "databricks_client_id",
+        "databricks_client_secret",
         "databricks_host",
         "databricks_vision_endpoint",
+        "databricks_vector_search_endpoint",
+        "databricks_vector_search_index",
+        "databricks_sql_http_path",
+        "databricks_sql_client_secret",
+        "databricks_uc_client_secret",
+        "databricks_jobs_client_secret",
+        "databricks_ai_search_client_secret",
+        "gemini_vision_model",
+        "gemini_chat_model",
         mode="before",
     )
     @classmethod
     def _blank_is_none(cls, value: object) -> object:
         return _empty_to_none(value)
+
+    @field_validator("databricks_host", mode="after")
+    @classmethod
+    def _normalize_databricks_host(cls, value: str | None) -> str | None:
+        return value.rstrip("/") if value else None
 
     @field_validator("model_dir", "data_dir", "log_dir", mode="after")
     @classmethod
@@ -176,8 +214,33 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "JWT_SECRET must be a strong random value (>= 32 chars) in production"
                 )
-            if not self.database_url:
-                raise ValueError("DATABASE_URL is required in production")
+            if not self.databricks_sql_http_path:
+                raise ValueError("DATABRICKS_SQL_HTTP_PATH is required in production")
+            client_secret = (
+                self.databricks_client_secret.get_secret_value()
+                if self.databricks_client_secret is not None
+                else ""
+            )
+            sql_secret_value = (
+                self.databricks_sql_client_secret.get_secret_value()
+                if self.databricks_sql_client_secret is not None
+                else client_secret
+            )
+            if not self.databricks_host or not self.databricks_client_id:
+                raise ValueError(
+                    "DATABRICKS_HOST and DATABRICKS_CLIENT_ID are required in production"
+                )
+            if not client_secret and not sql_secret_value:
+                raise ValueError(
+                    "DATABRICKS_CLIENT_SECRET or DATABRICKS_SQL_CLIENT_SECRET "
+                    "is required in production"
+                )
+            if not self.databricks_catalog or not self.databricks_schema:
+                raise ValueError(
+                    "DATABRICKS_CATALOG and DATABRICKS_SCHEMA are required in production"
+                )
+            if not self.databricks_volume_path:
+                raise ValueError("DATABRICKS_VOLUME_PATH is required in production")
         return self
 
     @property
@@ -187,6 +250,27 @@ class Settings(BaseSettings):
     @property
     def is_test(self) -> bool:
         return self.app_env == "test"
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.embedding_dimension
+
+    def databricks_secret_for(self, service: str) -> SecretStr | None:
+        mapping = {
+            "model-serving": self.databricks_client_secret,
+            "model_serving": self.databricks_client_secret,
+            "sql": self.databricks_sql_client_secret,
+            "uc": self.databricks_uc_client_secret,
+            "jobs": self.databricks_jobs_client_secret,
+            "ai-search": self.databricks_ai_search_client_secret,
+            "vector-search": self.databricks_ai_search_client_secret,
+            "files": self.databricks_files_client_secret,
+            "unity-catalog": (
+                self.databricks_uc_client_secret
+                or self.databricks_files_client_secret
+            ),
+        }
+        return mapping.get(service, self.databricks_client_secret)
 
     def ensure_runtime_dirs(self) -> None:
         for directory in (
@@ -202,6 +286,8 @@ class Settings(BaseSettings):
 
     @property
     def effective_chat_model(self) -> str:
+        if self.chat_provider == "databricks":
+            return self.databricks_model_serving_endpoint
         return (self.gemini_chat_model or self.gemini_vision_model or "").strip()
 
 

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
-from psycopg import AsyncConnection
-
 from app.config import Settings
+from app.db.compat import decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.logging_conf import get_logger
+from app.retrieval.ai_search import get_ai_search_status
 from app.retrieval.embeddings import Embedder, EmbeddingError
-from app.retrieval.knowledge import knowledge_chunk_boosts
+from app.retrieval.knowledge import knowledge_chunk_boosts, query_tokens
 from app.retrieval.reranker import Reranker, get_reranker
 
 logger = get_logger(__name__)
@@ -65,7 +65,7 @@ class RetrievedChunk:
 
 
 async def hybrid_search(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     embedder: Embedder,
     query: str,
@@ -86,6 +86,10 @@ async def hybrid_search(
         approved_only, document_ids, document_types, content_types
     )
 
+    search_status = get_ai_search_status(settings)
+    if search_status.fallback_active:
+        logger.debug("ai_search_fallback_active", reason=search_status.reason)
+
     vector: list[float] | None
     try:
         vector = await embedder.encode_query(query)
@@ -93,8 +97,9 @@ async def hybrid_search(
         logger.warning("dense_retrieval_unavailable", error=str(exc))
         vector = None
 
-    dense = await _dense_rows(conn, settings, vector, filters, filter_params)
-    lexical = await _lexical_rows(conn, settings, query, filters, filter_params)
+    rows = await _candidate_rows(conn, settings, filters, filter_params)
+    dense = _dense_rows(settings, rows, vector)
+    lexical = _lexical_rows(settings, query, rows)
     fused = _fuse(dense, lexical, k=settings.retrieval_rrf_k)
     if not fused and vector is None:
         raise RetrievalError(
@@ -111,7 +116,7 @@ async def hybrid_search(
 
 
 async def _apply_knowledge_boost(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     query: str,
     candidates: list[RetrievedChunk],
@@ -143,7 +148,7 @@ async def _apply_knowledge_boost(
 
 
 async def _apply_reranker(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     query: str,
     candidates: list[RetrievedChunk],
@@ -196,72 +201,110 @@ def _filters(
     else:
         clauses.append("dv.status = 'ready'")
     if document_ids:
-        clauses.append("c.document_id = ANY(%s::uuid[])")
-        params.append([str(value) for value in document_ids])
+        placeholders = ", ".join(["%s"] * len(document_ids))
+        clauses.append(f"c.document_id IN ({placeholders})")
+        params.extend(str(value) for value in document_ids)
     if document_types:
-        clauses.append("d.document_type = ANY(%s::text[])")
-        params.append([str(value) for value in document_types])
+        placeholders = ", ".join(["%s"] * len(document_types))
+        clauses.append(f"d.document_type IN ({placeholders})")
+        params.extend(str(value) for value in document_types)
     if content_types:
-        clauses.append("c.content_type = ANY(%s::text[])")
-        params.append([str(value) for value in content_types])
+        placeholders = ", ".join(["%s"] * len(content_types))
+        clauses.append(f"c.content_type IN ({placeholders})")
+        params.extend(str(value) for value in content_types)
     return " AND ".join(clauses), params
 
 
-async def _dense_rows(
-    conn: AsyncConnection,
+async def _candidate_rows(
+    conn: DatabricksConnection,
     settings: Settings,
-    vector: list[float] | None,
     filters: str,
     filter_params: list[Any],
+) -> list[dict[str, Any]]:
+    limit = min(
+        2000,
+        max(
+            200,
+            (settings.retrieval_dense_candidates + settings.retrieval_lexical_candidates) * 4,
+        ),
+    )
+    rows = await (
+        await conn.execute(
+            f"""
+            SELECT {_CHUNK_SELECT}, c.embedding
+            FROM document_chunks c
+            JOIN document_versions dv ON dv.id = c.document_version_id
+            JOIN documents d ON d.id = c.document_id
+            WHERE {filters}
+            ORDER BY c.chunk_index
+            LIMIT %s
+            """,
+            (*filter_params, limit),
+        )
+    ).fetchall()
+    return rows
+
+
+def _as_vector(value: Any) -> list[float] | None:
+    decoded = decode_json_value(value)
+    if isinstance(decoded, str):
+        return None
+    if not isinstance(decoded, list | tuple):
+        return None
+    try:
+        return [float(item) for item in decoded]
+    except (TypeError, ValueError):
+        return None
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = sum(a * a for a in left) ** 0.5
+    right_norm = sum(b * b for b in right) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _dense_rows(
+    settings: Settings,
+    rows: list[dict[str, Any]],
+    vector: list[float] | None,
 ) -> list[dict[str, Any]]:
     if vector is None:
         return []
-    literal = json.dumps(vector)
-    limit = max(1, settings.retrieval_dense_candidates)
-    rows = await (
-        await conn.execute(
-            f"""
-            SELECT {_CHUNK_SELECT},
-                   1 - (c.embedding <=> %s::vector) AS dense_score
-            FROM document_chunks c
-            JOIN document_versions dv ON dv.id = c.document_version_id
-            JOIN documents d ON d.id = c.document_id
-            WHERE {filters}
-              AND c.embedding IS NOT NULL
-            ORDER BY c.embedding <=> %s::vector
-            LIMIT %s
-            """,
-            (literal, *filter_params, literal, limit),
-        )
-    ).fetchall()
-    return rows
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        embedding = _as_vector(row.get("embedding"))
+        if embedding is None:
+            continue
+        score = _cosine(vector, embedding)
+        if score > 0:
+            scored.append({**row, "dense_score": score})
+    scored.sort(key=lambda item: item["dense_score"], reverse=True)
+    return scored[: max(1, settings.retrieval_dense_candidates)]
 
 
-async def _lexical_rows(
-    conn: AsyncConnection,
-    settings: Settings,
-    query: str,
-    filters: str,
-    filter_params: list[Any],
+def _lexical_rows(
+    settings: Settings, query: str, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    limit = max(1, settings.retrieval_lexical_candidates)
-    rows = await (
-        await conn.execute(
-            f"""
-            SELECT {_CHUNK_SELECT},
-                   ts_rank_cd(c.tsv, plainto_tsquery('simple', %s)) AS lexical_score
-            FROM document_chunks c
-            JOIN document_versions dv ON dv.id = c.document_version_id
-            JOIN documents d ON d.id = c.document_id
-            WHERE {filters}
-              AND c.tsv @@ plainto_tsquery('simple', %s)
-            ORDER BY lexical_score DESC
-            LIMIT %s
-            """,
-            (query, *filter_params, query, limit),
+    tokens = query_tokens(query, limit=16)
+    if not tokens:
+        return []
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        haystack = " ".join(
+            str(row.get(key) or "").lower()
+            for key in ("title", "heading", "content")
         )
-    ).fetchall()
-    return rows
+        hits = sum(1 for token in tokens if token in haystack)
+        if not hits:
+            continue
+        scored.append({**row, "lexical_score": hits / len(tokens)})
+    scored.sort(key=lambda item: item["lexical_score"], reverse=True)
+    return scored[: max(1, settings.retrieval_lexical_candidates)]
 
 
 def _fuse(
@@ -313,7 +356,7 @@ def _row_to_chunk(
         heading=row.get("heading"),
         content_type=str(row.get("content_type") or "unknown"),
         content=str(row["content"]),
-        metadata=dict(row.get("metadata") or {}),
+        metadata=dict(decode_json_value(row.get("metadata")) or {}),
         score=score,
         dense_score=dense_score,
         lexical_score=lexical_score,

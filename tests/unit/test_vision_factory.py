@@ -41,7 +41,8 @@ def test_provider_summaries_never_expose_secrets(tmp_path) -> None:
         gemini_vision_model="gemini-2.0-flash",
         qwen_vision_api_key="super-secret-qwen-key",
         databricks_host="https://example.databricks.com",
-        databricks_token="super-secret-databricks-token",
+        databricks_client_id="databricks-client-id",
+        databricks_client_secret="super-secret-databricks-secret",
         databricks_vision_endpoint="my-endpoint",
         model_dir=tmp_path / "models",
         data_dir=tmp_path / "data",
@@ -54,3 +55,6 @@ def test_provider_summaries_never_expose_secrets(tmp_path) -> None:
     gemini = next(item for item in summaries if item["provider"] == "gemini")
     assert gemini["configured"] is True
     assert gemini["credential_configured"] is True
+    databricks = next(item for item in summaries if item["provider"] == "databricks")
+    assert databricks["configured"] is True
+    assert databricks["credential_configured"] is True

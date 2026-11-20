@@ -1,8 +1,8 @@
 """Resumable in-process ingestion job runner.
 
-The API is a single process in Phase 2. CPU work is moved to worker threads,
-vision calls use the provider's configured concurrency, and job state is durable
-in PostgreSQL. An advisory lock prevents two runners from processing one job.
+CPU work is moved to worker threads, vision calls use the provider's configured
+concurrency, and job state is durable in Delta tables. A status claim prevents
+two runners from processing one job.
 """
 
 from __future__ import annotations
@@ -10,14 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
-from uuid import UUID
-
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
+from uuid import UUID, uuid4
 
 from app.config import Settings, get_settings
+from app.db.compat import Jsonb, decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_pool
 from app.ingestion.chunker import PageKnowledge, build_chunks
 from app.ingestion.classifier import classify_page
@@ -28,10 +29,11 @@ from app.ingestion.pdf_extractor import (
     image_hash,
     render_page_png,
 )
-from app.ingestion.registry import RegistryError, resolve_storage_path, version_context
+from app.ingestion.registry import RegistryError, materialize_storage_path, version_context
 from app.logging_conf import get_logger
 from app.retrieval.embeddings import EmbeddingError, get_embedder
 from app.services.audit import record_audit
+from app.storage.volume import get_volume_store
 from app.utils.hashing import sha256_text
 from app.vision.base import VisionConfigurationError, VisionError
 from app.vision.factory import build_provider
@@ -44,6 +46,41 @@ _TASKS: dict[str, asyncio.Task] = {}
 
 class JobRunnerError(RuntimeError):
     pass
+
+
+JSON_FIELDS = {
+    "analysis",
+    "analysis_usage",
+    "checkpoint_data",
+    "config",
+    "error_details",
+    "layout",
+    "stats",
+    "usage",
+}
+
+
+def _decode_row(row: Any) -> Any:
+    if isinstance(row, Mapping):
+        return {
+            key: decode_json_value(value) if key in JSON_FIELDS else value
+            for key, value in row.items()
+        }
+    return row
+
+
+def _new_id() -> int:
+    return time.time_ns()
+
+
+async def _materialize_image(settings: Settings, relative_path: str) -> Path | None:
+    local_path = settings.data_dir / relative_path
+    if local_path.is_file():
+        return local_path
+    data = await get_volume_store().read_bytes(relative_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(data)
+    return local_path
 
 
 def start_job(job_id: UUID | str, settings: Settings | None = None) -> None:
@@ -64,19 +101,28 @@ async def recover_stale_jobs(settings: Settings) -> None:
         stale = await (
             await conn.execute(
                 """
-                UPDATE ingestion_jobs
-                SET status = 'paused',
-                    stage = 'paused',
-                    error_details = jsonb_build_object(
-                        'reason', 'API restarted while the job was running'
-                    )
+                SELECT id FROM ingestion_jobs
                 WHERE status = 'running'
-                  AND (heartbeat_at IS NULL OR heartbeat_at < now() - interval '5 minutes')
-                RETURNING id
+                  AND (heartbeat_at IS NULL
+                       OR heartbeat_at < current_timestamp() - INTERVAL 5 MINUTE)
                 """
             )
         ).fetchall()
-        await conn.commit()
+        if stale:
+            await conn.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'paused',
+                    stage = 'paused',
+                    error_details = %s,
+                    updated_at = current_timestamp()
+                WHERE status = 'running'
+                  AND (heartbeat_at IS NULL
+                       OR heartbeat_at < current_timestamp() - INTERVAL 5 MINUTE)
+                """,
+                (Jsonb({"reason": "API restarted while the job was running"}),),
+            )
+            await conn.commit()
         for row in stale:
             logger.warning("ingestion_job_paused_after_restart", job_id=str(row["id"]))
 
@@ -97,26 +143,30 @@ async def run_ingestion_job(
     settings = settings or get_settings()
     pool = get_pool()
     async with pool.connection() as conn:
-        lock_key = f"fmm-ingestion:{job_id}"
-        locked = await (
+        await conn.execute(
+            """
+            UPDATE ingestion_jobs
+            SET status = 'running',
+                stage = 'queued',
+                heartbeat_at = current_timestamp(),
+                updated_at = current_timestamp()
+            WHERE id = %s AND status = 'queued'
+            """,
+            (str(job_id),),
+        )
+        claimed = await (
             await conn.execute(
-                "SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", (lock_key,)
+                "SELECT id FROM ingestion_jobs WHERE id = %s AND status = 'running'",
+                (str(job_id),),
             )
         ).fetchone()
         await conn.commit()
-        if not locked or not locked["locked"]:
+        if claimed is None:
             return
-        try:
-            await _run(conn, settings, job_id)
-        finally:
-            await _safe_rollback(conn)
-            await conn.execute(
-                "SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,)
-            )
-            await conn.commit()
+        await _run(conn, settings, job_id)
 
 
-async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
+async def _run(conn: DatabricksConnection, settings: Settings, job_id: UUID) -> None:
     job = await _get_job(conn, job_id)
     if job is None:
         return
@@ -137,7 +187,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
     stats.setdefault("chunks", 0)
 
     try:
-        source_path = resolve_storage_path(settings, version["storage_path"])
+        source_path = await materialize_storage_path(settings, version["storage_path"])
         if not source_path.is_file():
             raise RegistryError("Stored source file is missing")
 
@@ -170,7 +220,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
             return
 
         if str(version.get("document_type") or "pdf") == "pdf":
-            await _reuse_unchanged_analyses(conn, version, stats)
+            await _reuse_unchanged_analyses(conn, job_id, version, stats)
 
         if vision_mode != "none" and str(version.get("document_type") or "pdf") == "pdf":
             await _analyze_vision_pages(
@@ -200,7 +250,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
         stats["knowledge"] = knowledge_stats
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = 95, stage = 'knowledge', "
-            "heartbeat_at = now(), stats = %s WHERE id = %s",
+            "heartbeat_at = current_timestamp(), stats = %s WHERE id = %s",
             (Jsonb(stats), str(job_id)),
         )
         await conn.commit()
@@ -215,7 +265,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
             await conn.execute(
                 """
                 UPDATE document_versions
-                SET status = 'ready', page_count = %s, chunk_count = %s, indexed_at = now()
+                SET status = 'ready', page_count = %s, chunk_count = %s, indexed_at = current_timestamp()
                 WHERE id = %s
                 """,
                 (int(stats.get("pages") or completed_pages), chunk_count, str(version["id"])),
@@ -229,7 +279,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
                 UPDATE ingestion_jobs
                 SET status = 'completed', stage = 'completed', progress = 100,
                     completed_pages = %s, failed_pages = %s, stats = %s,
-                    heartbeat_at = now(), completed_at = now(), error_details = NULL
+                    heartbeat_at = current_timestamp(), completed_at = current_timestamp(), error_details = NULL
                 WHERE id = %s
                 """,
                 (completed_pages, failed_pages, Jsonb(stats), str(job_id)),
@@ -269,7 +319,7 @@ async def _run(conn: AsyncConnection, settings: Settings, job_id: UUID) -> None:
 
 
 async def _extract(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     job_id: UUID,
     version: dict[str, Any],
@@ -330,27 +380,53 @@ async def _extract(
             content_type = "table" if page.tables else "unknown"
             await conn.execute(
                 """
-                INSERT INTO document_pages
-                    (document_version_id, physical_page_number, page_text, text_hash,
+                MERGE INTO document_pages AS target
+                USING (
+                    SELECT
+                        %s AS document_version_id,
+                        %s AS physical_page_number,
+                        %s AS page_text,
+                        %s AS text_hash,
+                        %s AS content_type,
+                        %s AS processing_status,
+                        %s AS text_source,
+                        %s AS text_char_count,
+                        %s AS image_count,
+                        %s AS image_coverage,
+                        %s AS width_pt,
+                        %s AS height_pt,
+                        %s AS layout
+                ) AS source
+                ON target.document_version_id = source.document_version_id
+                   AND target.physical_page_number = source.physical_page_number
+                WHEN MATCHED THEN UPDATE SET
+                    page_text = source.page_text,
+                    text_hash = source.text_hash,
+                    content_type = source.content_type,
+                    text_source = source.text_source,
+                    text_char_count = source.text_char_count,
+                    image_count = source.image_count,
+                    image_coverage = source.image_coverage,
+                    width_pt = source.width_pt,
+                    height_pt = source.height_pt,
+                    layout = source.layout,
+                    processing_status = CASE
+                        WHEN target.analysis IS NULL THEN source.processing_status
+                        ELSE target.processing_status
+                    END,
+                    updated_at = current_timestamp()
+                WHEN NOT MATCHED THEN INSERT
+                    (id, document_version_id, physical_page_number, page_text, text_hash,
                      content_type, processing_status, text_source, text_char_count,
-                     image_count, image_coverage, width_pt, height_pt, layout)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (document_version_id, physical_page_number) DO UPDATE
-                    SET page_text = EXCLUDED.page_text,
-                        text_hash = EXCLUDED.text_hash,
-                        content_type = EXCLUDED.content_type,
-                        text_source = EXCLUDED.text_source,
-                        text_char_count = EXCLUDED.text_char_count,
-                        image_count = EXCLUDED.image_count,
-                        image_coverage = EXCLUDED.image_coverage,
-                        width_pt = EXCLUDED.width_pt,
-                        height_pt = EXCLUDED.height_pt,
-                        layout = EXCLUDED.layout,
-                        processing_status = CASE
-                            WHEN document_pages.analysis IS NULL THEN EXCLUDED.processing_status
-                            ELSE document_pages.processing_status
-                        END,
-                        updated_at = now()
+                     image_count, image_coverage, width_pt, height_pt, layout,
+                     created_at, updated_at)
+                    VALUES
+                    (%s, source.document_version_id, source.physical_page_number,
+                     source.page_text, source.text_hash, source.content_type,
+                     source.processing_status, source.text_source, source.text_char_count,
+                     source.image_count, source.image_coverage, source.width_pt,
+                     source.height_pt, source.layout,
+                     current_timestamp(), current_timestamp())
                 """,
                 (
                     str(version_id),
@@ -366,12 +442,13 @@ async def _extract(
                     page.width_pt,
                     page.height_pt,
                     Jsonb(layout),
+                    str(uuid4()),
                 ),
             )
         await _set_checkpoint(conn, job_id, "extract", {"pages": extraction.page_count})
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = 15, stage = 'extracted', "
-            "total_pages = %s, completed_pages = %s, heartbeat_at = now(), "
+            "total_pages = %s, completed_pages = %s, heartbeat_at = current_timestamp(), "
             "stats = %s WHERE id = %s",
             (
                 extraction.page_count,
@@ -390,7 +467,8 @@ async def _extract(
 
 
 async def _reuse_unchanged_analyses(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
+    job_id: UUID,
     version: dict[str, Any],
     stats: dict[str, Any],
 ) -> int:
@@ -420,55 +498,74 @@ async def _reuse_unchanged_analyses(
     if previous is None:
         return 0
 
-    reused = await (
+    previous_id = str(previous["id"])
+    matched = await (
         await conn.execute(
             """
-            UPDATE document_pages current
-            SET analysis = previous.analysis,
-                analysis_provider = previous.analysis_provider,
-                analysis_model = previous.analysis_model,
-                analysis_latency_ms = previous.analysis_latency_ms,
-                analysis_usage = previous.analysis_usage,
-                analyzed_at = previous.analyzed_at,
-                content_type = previous.content_type,
-                confidence = previous.confidence,
-                needs_review = previous.needs_review,
-                page_image_path = previous.page_image_path,
-                processing_status = CASE
-                    WHEN previous.needs_review THEN 'needs_review'
-                    ELSE 'completed'
-                END,
-                updated_at = now()
-            FROM document_pages previous
+            SELECT count(*) AS n
+            FROM document_pages current
+            JOIN document_pages previous
+              ON current.physical_page_number = previous.physical_page_number
+             AND current.text_hash = previous.text_hash
             WHERE current.document_version_id = %s
               AND previous.document_version_id = %s
               AND current.analysis IS NULL
-              AND current.text_hash = previous.text_hash
               AND previous.analysis IS NOT NULL
-            RETURNING current.id
             """,
-            (version_id, str(previous["id"])),
+            (version_id, previous_id),
         )
-    ).fetchall()
-    count = len(reused)
-    if count:
-        stats["reused_pages"] = int(stats.get("reused_pages", 0)) + count
-        await conn.execute(
-            "UPDATE ingestion_jobs SET stats = %s WHERE id = %s",
-            (Jsonb(stats), str(version["id"])),
-        )
-        await conn.commit()
-        logger.info(
-            "page_analyses_reused",
-            version_id=version_id,
-            previous_version_id=str(previous["id"]),
-            pages=count,
-        )
+    ).fetchone()
+    count = int(matched["n"]) if matched else 0
+    if not count:
+        return 0
+
+    await conn.execute(
+        """
+        MERGE INTO document_pages AS current_page
+        USING (
+            SELECT * FROM document_pages
+            WHERE document_version_id = %s AND analysis IS NOT NULL
+        ) AS previous
+        ON current_page.document_version_id = %s
+           AND current_page.physical_page_number = previous.physical_page_number
+           AND current_page.text_hash = previous.text_hash
+           AND current_page.analysis IS NULL
+        WHEN MATCHED THEN UPDATE SET
+            analysis = previous.analysis,
+            analysis_provider = previous.analysis_provider,
+            analysis_model = previous.analysis_model,
+            analysis_latency_ms = previous.analysis_latency_ms,
+            analysis_usage = previous.analysis_usage,
+            analyzed_at = previous.analyzed_at,
+            content_type = previous.content_type,
+            confidence = previous.confidence,
+            needs_review = previous.needs_review,
+            page_image_path = previous.page_image_path,
+            processing_status = CASE
+                WHEN previous.needs_review THEN 'needs_review'
+                ELSE 'completed'
+            END,
+            updated_at = current_timestamp()
+        """,
+        (previous_id, version_id),
+    )
+    stats["reused_pages"] = int(stats.get("reused_pages", 0)) + count
+    await conn.execute(
+        "UPDATE ingestion_jobs SET stats = %s WHERE id = %s",
+        (Jsonb(stats), str(job_id)),
+    )
+    await conn.commit()
+    logger.info(
+        "page_analyses_reused",
+        version_id=version_id,
+        previous_version_id=previous_id,
+        pages=count,
+    )
     return count
 
 
 async def _extract_structured_document(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     version: dict[str, Any],
     source_path,
@@ -499,7 +596,7 @@ async def _extract_structured_document(
 
 
 async def _store_structured_extraction(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     version: dict[str, Any],
     extraction: DocumentExtraction,
@@ -534,12 +631,15 @@ async def _store_structured_extraction(
             await conn.execute(
                 """
                 INSERT INTO document_pages
-                    (document_version_id, physical_page_number, page_text, text_hash,
+                    (id, document_version_id, physical_page_number, page_text, text_hash,
                      content_type, processing_status, text_source, text_char_count,
-                     image_count, image_coverage, width_pt, height_pt, layout)
-                VALUES (%s, %s, %s, %s, %s, 'completed', %s, %s, 0, 0, 0, 0, %s)
+                     image_count, image_coverage, width_pt, height_pt, layout,
+                     created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, 'completed', %s, %s, 0, 0, 0, 0, %s,
+                        current_timestamp(), current_timestamp())
                 """,
                 (
+                    str(uuid4()),
                     str(version_id),
                     page.page_number,
                     page.text,
@@ -553,7 +653,7 @@ async def _store_structured_extraction(
         await _set_checkpoint(conn, job_id, "extract", {"pages": extraction.page_count})
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = 15, stage = 'extracted', "
-            "total_pages = %s, completed_pages = %s, heartbeat_at = now(), "
+            "total_pages = %s, completed_pages = %s, heartbeat_at = current_timestamp(), "
             "stats = %s WHERE id = %s",
             (
                 extraction.page_count,
@@ -580,7 +680,7 @@ def _text_content_type(text: str) -> str:
 
 
 async def _analyze_vision_pages(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     job_id: UUID,
     version: dict[str, Any],
@@ -594,7 +694,7 @@ async def _analyze_vision_pages(
     if not rows:
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = 50, stage = 'vision_skipped', "
-            "heartbeat_at = now() WHERE id = %s",
+            "heartbeat_at = current_timestamp() WHERE id = %s",
             (str(job_id),),
         )
         await conn.commit()
@@ -629,6 +729,8 @@ async def _analyze_vision_pages(
                 )
                 image_path = render_dir / f"page-{page_number:04d}.png"
                 await asyncio.to_thread(image_path.write_bytes, image)
+                relative_image = image_path.relative_to(settings.data_dir).as_posix()
+                await get_volume_store().write_bytes(relative_image, image)
                 context = context_by_page.get(page_number, {})
                 metadata = PageMetadata(
                     document_id=str(version["document_id"]),
@@ -656,7 +758,7 @@ async def _analyze_vision_pages(
                     page_context=page_context,
                     metadata=metadata,
                 )
-                return row, image_path, image, result, int((time.perf_counter() - started) * 1000)
+                return row, image, result, int((time.perf_counter() - started) * 1000), relative_image
 
         results = await asyncio.gather(
             *(analyze(row) for row in batch), return_exceptions=True
@@ -670,28 +772,27 @@ async def _analyze_vision_pages(
                     conn, job_id, row["id"], provider_name, model_name, outcome
                 )
                 await conn.execute(
-                    "UPDATE document_pages SET processing_status = 'failed', updated_at = now() "
+                    "UPDATE document_pages SET processing_status = 'failed', updated_at = current_timestamp() "
                     "WHERE id = %s",
                     (row["id"],),
                 )
                 continue
 
-            page_row, image_path, image, result, latency_ms = outcome
+            page_row, image, result, latency_ms, relative_image = outcome
             analysis = result.result.model_dump(mode="json")
             analysis["_provider"] = result.provider
             analysis["_model"] = result.model
             usage = result.usage.model_dump(mode="json")
             status = "needs_review" if result.result.needs_review else "completed"
-            relative_image = image_path.relative_to(settings.data_dir).as_posix()
             await conn.execute(
                 """
                 UPDATE document_pages
                 SET page_image_path = %s, image_hash = %s, analysis = %s,
                     analysis_provider = %s, analysis_model = %s,
                     analysis_latency_ms = %s, analysis_usage = %s,
-                    analyzed_at = now(), content_type = %s, confidence = %s,
+                    analyzed_at = current_timestamp(), content_type = %s, confidence = %s,
                     needs_review = %s, vision_provider = %s, vision_model = %s,
-                    processing_status = %s, updated_at = now()
+                    processing_status = %s, updated_at = current_timestamp()
                 WHERE id = %s
                 """,
                 (
@@ -714,10 +815,12 @@ async def _analyze_vision_pages(
             await conn.execute(
                 """
                 INSERT INTO vision_runs
-                    (job_id, document_page_id, provider, model, status, latency_ms, usage)
-                VALUES (%s, %s, %s, %s, 'completed', %s, %s)
+                    (id, job_id, document_page_id, provider, model, status,
+                     latency_ms, usage, created_at)
+                VALUES (%s, %s, %s, %s, %s, 'completed', %s, %s, current_timestamp())
                 """,
                 (
+                    _new_id(),
                     str(job_id),
                     page_row["id"],
                     result.provider,
@@ -734,7 +837,7 @@ async def _analyze_vision_pages(
         progress = 15 + int(35 * processed / max(1, total))
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = %s, stage = 'vision', "
-            "heartbeat_at = now(), stats = %s WHERE id = %s",
+            "heartbeat_at = current_timestamp(), stats = %s WHERE id = %s",
             (progress, Jsonb(stats), str(job_id)),
         )
         await conn.commit()
@@ -744,7 +847,7 @@ async def _analyze_vision_pages(
 
 
 async def _ocr_scanned_pages(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     version: dict[str, Any],
     stats: dict[str, Any],
@@ -789,8 +892,8 @@ async def _ocr_scanned_pages(
         return
 
     for row in rows:
-        image_path = settings.data_dir / str(row["page_image_path"])
-        if not image_path.is_file():
+        image_path = await _materialize_image(settings, str(row["page_image_path"]))
+        if image_path is None:
             continue
         try:
             result = await ocr_page_image(engine, image_path)
@@ -807,7 +910,7 @@ async def _ocr_scanned_pages(
                 text_hash = %s,
                 text_char_count = %s,
                 text_source = 'ocr',
-                updated_at = now()
+                updated_at = current_timestamp()
             WHERE id = %s
             """,
             (
@@ -833,7 +936,7 @@ async def _ocr_scanned_pages(
 
 
 async def _build_and_embed_chunks(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     job_id: UUID,
     version: dict[str, Any],
@@ -858,13 +961,15 @@ async def _build_and_embed_chunks(
             await conn.execute(
                 """
                 INSERT INTO document_chunks
-                    (document_version_id, document_id, page_start, page_end,
+                    (id, document_version_id, document_id, page_start, page_end,
                      chunk_index, section_number, heading, content_type, content,
                      content_hash, char_count, token_estimate, metadata,
-                     embedding_model, embedding_dim)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     embedding_model, embedding_dim, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        current_timestamp())
                 """,
                 (
+                    str(uuid4()),
                     str(version_id),
                     str(version["document_id"]),
                     chunk.page_start,
@@ -889,7 +994,7 @@ async def _build_and_embed_chunks(
         await _set_checkpoint(conn, job_id, "chunk", {"chunks": len(chunks)})
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = 65, stage = 'chunked', "
-            "heartbeat_at = now(), stats = %s WHERE id = %s",
+            "heartbeat_at = current_timestamp(), stats = %s WHERE id = %s",
             (Jsonb({**stats, "chunks": len(chunks)}), str(job_id)),
         )
     stats["chunks"] = len(chunks)
@@ -908,13 +1013,13 @@ async def _build_and_embed_chunks(
             for row, vector in zip(batch, vectors, strict=True):
                 if len(vector) != settings.embedding_dim:
                     raise EmbeddingError(
-                        f"Embedding dimension {len(vector)} does not match EMBEDDING_DIM"
+                        f"Embedding dimension {len(vector)} does not match EMBEDDING_DIMENSION"
                     )
                 await conn.execute(
                     """
                     UPDATE document_chunks
-                    SET embedding = %s::vector, embedding_model = %s,
-                        embedding_dim = %s, embedding_updated_at = now()
+                    SET embedding = from_json(%s, 'ARRAY<FLOAT>'), embedding_model = %s,
+                        embedding_dim = %s, embedding_updated_at = current_timestamp()
                     WHERE id = %s
                     """,
                     (
@@ -928,7 +1033,7 @@ async def _build_and_embed_chunks(
         progress = 65 + int(25 * done / max(1, total))
         await conn.execute(
             "UPDATE ingestion_jobs SET progress = %s, stage = 'embedding', "
-            "heartbeat_at = now() WHERE id = %s",
+            "heartbeat_at = current_timestamp() WHERE id = %s",
             (progress, str(job_id)),
         )
         await conn.commit()
@@ -936,7 +1041,7 @@ async def _build_and_embed_chunks(
     await conn.commit()
 
 
-async def _vision_page_rows(conn: AsyncConnection, version_id: UUID) -> list[dict[str, Any]]:
+async def _vision_page_rows(conn: DatabricksConnection, version_id: UUID) -> list[dict[str, Any]]:
     return await (
         await conn.execute(
             """
@@ -944,7 +1049,7 @@ async def _vision_page_rows(conn: AsyncConnection, version_id: UUID) -> list[dic
             FROM document_pages
             WHERE document_version_id = %s
               AND analysis IS NULL
-              AND coalesce((layout->'classification'->>'needs_vision')::boolean, false)
+              AND coalesce(get_json_object(layout, '$.classification.needs_vision'), 'false') = 'true'
               AND processing_status IN ('pending', 'failed')
             ORDER BY physical_page_number
             """,
@@ -953,7 +1058,7 @@ async def _vision_page_rows(conn: AsyncConnection, version_id: UUID) -> list[dic
     ).fetchall()
 
 
-async def _page_context_map(conn: AsyncConnection, version_id: UUID) -> dict[int, dict[str, Any]]:
+async def _page_context_map(conn: DatabricksConnection, version_id: UUID) -> dict[int, dict[str, Any]]:
     rows = await (
         await conn.execute(
             """
@@ -965,6 +1070,7 @@ async def _page_context_map(conn: AsyncConnection, version_id: UUID) -> dict[int
             (str(version_id),),
         )
     ).fetchall()
+    rows = [_decode_row(row) for row in rows]
     context: dict[int, dict[str, Any]] = {}
     for index, row in enumerate(rows):
         previous = rows[index - 1] if index > 0 else None
@@ -1003,8 +1109,8 @@ def _section_for(row: dict[str, Any]) -> str | None:
     return None
 
 
-async def _all_page_rows(conn: AsyncConnection, version_id: UUID) -> list[dict[str, Any]]:
-    return await (
+async def _all_page_rows(conn: DatabricksConnection, version_id: UUID) -> list[dict[str, Any]]:
+    rows = await (
         await conn.execute(
             """
             SELECT physical_page_number, page_text, text_hash, content_type, layout,
@@ -1017,9 +1123,10 @@ async def _all_page_rows(conn: AsyncConnection, version_id: UUID) -> list[dict[s
             (str(version_id),),
         )
     ).fetchall()
+    return [_decode_row(row) for row in rows]
 
 
-async def _load_page_extractions(conn: AsyncConnection, version_id: UUID) -> list[PageExtraction]:
+async def _load_page_extractions(conn: DatabricksConnection, version_id: UUID) -> list[PageExtraction]:
     rows = await _all_page_rows(conn, version_id)
     return [_row_to_extraction(row) for row in rows]
 
@@ -1044,7 +1151,7 @@ def _row_to_extraction(row: dict[str, Any]) -> PageExtraction:
     )
 
 
-async def _chunks_without_embeddings(conn: AsyncConnection, version_id: UUID) -> list[dict[str, Any]]:
+async def _chunks_without_embeddings(conn: DatabricksConnection, version_id: UUID) -> list[dict[str, Any]]:
     return await (
         await conn.execute(
             """
@@ -1058,7 +1165,7 @@ async def _chunks_without_embeddings(conn: AsyncConnection, version_id: UUID) ->
 
 
 async def _record_vision_failure(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     page_id: str,
     provider: str,
@@ -1069,21 +1176,22 @@ async def _record_vision_failure(
     await conn.execute(
         """
         INSERT INTO vision_runs
-            (job_id, document_page_id, provider, model, status, error)
-        VALUES (%s, %s, %s, %s, 'failed', %s)
+            (id, job_id, document_page_id, provider, model, status, error, created_at)
+        VALUES (%s, %s, %s, %s, %s, 'failed', %s, current_timestamp())
         """,
-        (str(job_id), page_id, provider, model, message),
+        (_new_id(), str(job_id), page_id, provider, model, message),
     )
     await conn.commit()
 
 
-async def _get_job(conn: AsyncConnection, job_id: UUID) -> dict[str, Any] | None:
-    return await (
+async def _get_job(conn: DatabricksConnection, job_id: UUID) -> dict[str, Any] | None:
+    row = await (
         await conn.execute("SELECT * FROM ingestion_jobs WHERE id = %s", (str(job_id),))
     ).fetchone()
+    return _decode_row(row)
 
 
-async def _update_job(conn: AsyncConnection, job_id: UUID, **fields: Any) -> None:
+async def _update_job(conn: DatabricksConnection, job_id: UUID, **fields: Any) -> None:
     allowed = {
         "status",
         "stage",
@@ -1110,7 +1218,7 @@ async def _update_job(conn: AsyncConnection, job_id: UUID, **fields: Any) -> Non
     await conn.commit()
 
 
-async def _cancel_requested(conn: AsyncConnection, job_id: UUID) -> bool:
+async def _cancel_requested(conn: DatabricksConnection, job_id: UUID) -> bool:
     row = await (
         await conn.execute(
             "SELECT cancel_requested, status FROM ingestion_jobs WHERE id = %s",
@@ -1121,12 +1229,12 @@ async def _cancel_requested(conn: AsyncConnection, job_id: UUID) -> bool:
 
 
 async def _mark_cancelled(
-    conn: AsyncConnection, job_id: UUID, version: dict[str, Any]
+    conn: DatabricksConnection, job_id: UUID, version: dict[str, Any]
 ) -> None:
     async with conn.transaction():
         await conn.execute(
             "UPDATE ingestion_jobs SET status = 'cancelled', stage = 'cancelled', "
-            "completed_at = now(), heartbeat_at = now() WHERE id = %s",
+            "completed_at = current_timestamp(), heartbeat_at = current_timestamp() WHERE id = %s",
             (str(job_id),),
         )
         await conn.execute(
@@ -1141,7 +1249,7 @@ async def _mark_cancelled(
 
 
 async def _fail_job(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     message: str,
     *,
@@ -1150,7 +1258,7 @@ async def _fail_job(
     async with conn.transaction():
         await conn.execute(
             "UPDATE ingestion_jobs SET status = 'failed', stage = 'failed', "
-            "completed_at = now(), heartbeat_at = now(), error_details = %s "
+            "completed_at = current_timestamp(), heartbeat_at = current_timestamp(), error_details = %s "
             "WHERE id = %s",
             (Jsonb({"message": message[:4000]}), str(job_id)),
         )
@@ -1168,7 +1276,7 @@ async def _fail_job(
 
 
 async def _get_checkpoint(
-    conn: AsyncConnection, job_id: UUID, key: str
+    conn: DatabricksConnection, job_id: UUID, key: str
 ) -> dict[str, Any] | None:
     row = await (
         await conn.execute(
@@ -1176,38 +1284,49 @@ async def _get_checkpoint(
             (str(job_id), key),
         )
     ).fetchone()
-    return row["checkpoint_data"] if row else None
+    return decode_json_value(row["checkpoint_data"]) if row else None
 
 
 async def _set_checkpoint(
-    conn: AsyncConnection, job_id: UUID, key: str, data: dict[str, Any]
+    conn: DatabricksConnection, job_id: UUID, key: str, data: dict[str, Any]
 ) -> None:
     await conn.execute(
         """
-        INSERT INTO job_checkpoints (job_id, checkpoint_key, checkpoint_data)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (job_id, checkpoint_key) DO UPDATE
-            SET checkpoint_data = EXCLUDED.checkpoint_data,
-                created_at = now()
+        MERGE INTO job_checkpoints AS target
+        USING (
+            SELECT %s AS job_id, %s AS checkpoint_key, %s AS checkpoint_data
+        ) AS source
+        ON target.job_id = source.job_id
+           AND target.checkpoint_key = source.checkpoint_key
+        WHEN MATCHED THEN UPDATE SET
+            checkpoint_data = source.checkpoint_data,
+            created_at = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT
+            (id, job_id, checkpoint_key, checkpoint_data, created_at)
+            VALUES (%s, source.job_id, source.checkpoint_key, source.checkpoint_data,
+                    current_timestamp())
         """,
-        (str(job_id), key, Jsonb(data)),
+        (str(job_id), key, Jsonb(data), _new_id()),
     )
 
 
 async def _count_pages(
-    conn: AsyncConnection, version_id: UUID, *, statuses: tuple[str, ...]
+    conn: DatabricksConnection, version_id: UUID, *, statuses: tuple[str, ...]
 ) -> int:
+    if not statuses:
+        return 0
+    placeholders = ", ".join(["%s"] * len(statuses))
     row = await (
         await conn.execute(
-            "SELECT count(*) AS n FROM document_pages "
-            "WHERE document_version_id = %s AND processing_status = ANY(%s)",
-            (str(version_id), list(statuses)),
+            f"SELECT count(*) AS n FROM document_pages "
+            f"WHERE document_version_id = %s AND processing_status IN ({placeholders})",
+            (str(version_id), *statuses),
         )
     ).fetchone()
     return int(row["n"])
 
 
-async def _count_all_pages(conn: AsyncConnection, version_id: UUID) -> int:
+async def _count_all_pages(conn: DatabricksConnection, version_id: UUID) -> int:
     row = await (
         await conn.execute(
             "SELECT count(*) AS n FROM document_pages WHERE document_version_id = %s",
@@ -1217,7 +1336,7 @@ async def _count_all_pages(conn: AsyncConnection, version_id: UUID) -> int:
     return int(row["n"])
 
 
-async def _safe_rollback(conn: AsyncConnection) -> None:
+async def _safe_rollback(conn: DatabricksConnection) -> None:
     try:
         await conn.rollback()
     except Exception:  # noqa: BLE001 - the connection may already be closed

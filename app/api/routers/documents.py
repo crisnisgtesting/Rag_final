@@ -7,12 +7,12 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from psycopg import AsyncConnection
 from pydantic import BaseModel
 
 from app.api.deps import get_app_settings
 from app.auth.dependencies import CurrentUser, get_current_user, require_admin
 from app.config import Settings
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.ingestion import registry
 from app.ingestion.job_runner import start_job
@@ -47,7 +47,7 @@ def _registry_error(exc: registry.RegistryError, status_code: int = 400) -> HTTP
 
 @router.get("")
 async def list_documents(
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     items = await registry.list_documents(conn)
@@ -56,7 +56,7 @@ async def list_documents(
 
 @router.post("/scan")
 async def scan_documents(
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -68,7 +68,7 @@ async def scan_documents(
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -102,7 +102,7 @@ async def upload_document(
 @router.get("/{document_id}")
 async def document_detail(
     document_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     detail = await registry.document_detail(conn, document_id)
@@ -115,7 +115,7 @@ async def document_detail(
 async def version_pages(
     version_id: UUID,
     limit: int = Query(default=500, ge=1, le=2000),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     version = await registry.version_context(conn, version_id)
@@ -129,7 +129,7 @@ async def version_pages(
 async def version_chunks(
     version_id: UUID,
     limit: int = Query(default=100, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     _: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     version = await registry.version_context(conn, version_id)
@@ -143,7 +143,7 @@ async def version_chunks(
 async def ingest_version(
     version_id: UUID,
     payload: IngestRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -205,7 +205,7 @@ async def ingest_version(
 @router.post("/versions/{version_id}/approve")
 async def approve_version(
     version_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:
@@ -222,7 +222,7 @@ async def approve_version(
 @router.post("/versions/{version_id}/reject")
 async def reject_version(
     version_id: UUID,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     user: CurrentUser = Depends(require_admin),
 ) -> dict[str, Any]:
     try:

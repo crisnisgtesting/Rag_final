@@ -1,7 +1,7 @@
 # FMM Knowledge and Operational Assistant (CRIS)
 
 Internal, multilingual technical assistant for the FMM machine. The system is
-database-first: PostgreSQL is the source of truth for documents, extracted
+Databricks-native: Delta tables are the source of truth for documents, extracted
 knowledge, settings, users and audit history.
 
 **Current status: Phases 1 to 6 implemented.** The system ingests PDF, DOCX and
@@ -14,13 +14,13 @@ searchable. See the phase implementation logs at the end of this file.
 
 ## Stack
 
-- Python 3.11, FastAPI, Pydantic v2, psycopg 3
-- PostgreSQL 16 + pgvector
+- Python 3.11, FastAPI, Pydantic v2, Databricks SQL Connector
+- Databricks SQL, Delta tables, AI Search, UC Volumes, Model Serving
 - Streamlit frontend
 - PyMuPDF for PDF extraction and page rendering
 - BAAI/bge-m3 through ONNX Runtime (the managed machine blocks PyTorch)
 - Vision providers: Qwen3-VL, Gemini, Databricks Model Serving
-- Gemini chat with strict source grounding and citations
+- Databricks Model Serving chat with strict source grounding and citations
 - faster-whisper for local voice transcription (optional)
 
 No Docker. No Redis. No LangChain.
@@ -28,11 +28,9 @@ No Docker. No Redis. No LangChain.
 ## Requirements
 
 - Python 3.11 (3.11.x only)
-- PostgreSQL 16 with the `vector` extension. Phase 2 retrieval uses dense vectors
-  plus PostgreSQL's built-in full-text search (`simple` configuration), so
-  `pg_trgm` and `unaccent` are not required.
-- For local development on Windows/macOS/Linux, the `pgserver` development
-  dependency provides PostgreSQL 16.2 with pgvector in user space.
+- Databricks workspace with SQL warehouse, Unity Catalog and UC Volume access.
+- Service principal OAuth credentials with SQL, Model Serving, Unity Catalog,
+  Jobs and AI Search scopes. PATs and PostgreSQL are not used by the runtime.
 
 ## Quick start
 
@@ -98,20 +96,30 @@ venv/bin/python scripts/create_admin.py --username admin
 ./scripts/start_ui.sh
 ```
 
-On production Linux hosts, point `DATABASE_URL` at the managed PostgreSQL 16
-server instead of using `scripts/dev_db.py`.
+On production Databricks Apps or Linux hosts, configure
+`DATABRICKS_SQL_HTTP_PATH` and the OAuth credentials below; there is no
+PostgreSQL server to start.
 
 ## Configuration
 
 All configuration is environment based and read from `config/.env` (never
 committed). See `config/.env.example` for every variable. Secrets are held in
-memory and are never stored in PostgreSQL, returned by the API or written to
-logs.
+memory and are never persisted to application storage, returned by the API or
+written to logs.
+
+Databricks SQL, Model Serving and AI Search use Service Principal OAuth, not
+personal access tokens. Set `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`,
+`DATABRICKS_SQL_CLIENT_SECRET`, `DATABRICKS_SQL_HTTP_PATH`,
+`DATABRICKS_SQL_OAUTH_SCOPE=sql`, `DATABRICKS_OAUTH_SCOPE=model-serving`,
+`DATABRICKS_MODEL_SERVING_ENDPOINT`, `DATABRICKS_VECTOR_SEARCH_ENDPOINT` and
+`DATABRICKS_AI_SEARCH_OAUTH_SCOPE=ai-search`. The AI Search index remains blank
+until the endpoint type and index are verified; local BGE-M3 cosine search stays
+active while unavailable.
 
 Vision provider selection:
 
-- `VISION_PROVIDER` sets the environment default (`qwen`, `gemini` or
-  `databricks`).
+- `VISION_PROVIDER` sets the environment default (`databricks`, `qwen` or
+  `gemini`).
 - Administrators can override it at runtime in the UI; the override is stored
   in `app_settings` and applies to newly scheduled work.
 - Selection is explicit. There is no automatic fallback between providers or
@@ -125,6 +133,11 @@ Vision provider selection:
 
 Databricks endpoints must use the verified `openai_chat` content-parts payload
 style.
+
+`CHAT_PROVIDER` defaults to `databricks`; `DATABRICKS_MODEL_SERVING_ENDPOINT`
+sets the model name reported by API responses and logs. Keep
+`DATABRICKS_MODEL_SUPPORTS_PARAMETERS=false` until the endpoint's request schema
+is verified.
 
 ## Database
 
@@ -193,7 +206,7 @@ Knowledge organization is rebuilt from page analyses with:
 ## API
 
 - `GET /health/live` - process liveness
-- `GET /health/ready` - PostgreSQL and pgvector readiness (HTTP 503 when not ready)
+- `GET /health/ready` - Databricks SQL readiness (HTTP 503 when not ready)
 - `POST /auth/login` - JWT access token
 - `GET /auth/me` - current user
 - `GET /admin/vision/providers` - provider configuration (no secrets)

@@ -12,9 +12,8 @@ from collections import defaultdict
 from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
-
+from app.db.compat import Jsonb, decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.utils.hashing import sha256_text
 
 _NUMBERED_STEP_RE = re.compile(
@@ -24,7 +23,7 @@ _TIMESTAMP_RE = re.compile(r"\(\d{1,2}:\d{2}(?:\s*-\s*\d{1,2}:\d{2})?\)")
 
 
 async def rebuild_version_knowledge(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version_id: UUID,
     *,
     mark_approved: bool = False,
@@ -45,7 +44,7 @@ async def rebuild_version_knowledge(
     if version is None:
         raise ValueError("Document version was not found")
 
-    pages = await (
+    page_rows = await (
         await conn.execute(
             """
             SELECT id, physical_page_number, page_text, content_type, layout,
@@ -57,9 +56,13 @@ async def rebuild_version_knowledge(
             (str(version_id),),
         )
     ).fetchall()
+    pages = [dict(page) for page in page_rows]
+    for page in pages:
+        page["layout"] = decode_json_value(page.get("layout")) or {}
+        page["analysis"] = decode_json_value(page.get("analysis")) or {}
 
     status = "approved" if mark_approved else "proposed"
-    approved_sql = "now()" if mark_approved else "NULL"
+    approved_sql = "current_timestamp()" if mark_approved else "NULL"
     approved_by_sql = "%s" if mark_approved and actor_user_id else "NULL"
 
     stats = {
@@ -124,11 +127,12 @@ async def rebuild_version_knowledge(
                         f"""
                         INSERT INTO knowledge_entities
                             (id, document_id, document_version_id, entity_type, name,
-                             normalized_name, description, attributes, confidence,
-                             status, source_page_start, source_page_end, approved_at,
-                             approved_by)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                {approved_sql}, {approved_by_sql})
+                             normalized_name, description, attributes, metadata,
+                             confidence, status, source_page_start, source_page_end,
+                             approved_at, approved_by, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                {approved_sql}, {approved_by_sql}, current_timestamp(),
+                                current_timestamp())
                         """,
                         (
                             str(entity_id),
@@ -139,6 +143,7 @@ async def rebuild_version_knowledge(
                             normalized[:500],
                             str(item.get("description") or "")[:8000],
                             Jsonb(item.get("attributes") or {}),
+                            Jsonb({}),
                             _confidence(analysis.get("confidence"), 0.6),
                             status,
                             int(page["physical_page_number"]),
@@ -165,15 +170,19 @@ async def rebuild_version_knowledge(
                 shared = _shared_page(from_pages, to_pages)
                 if shared is None:
                     continue
+                relationship_id = uuid4()
                 await conn.execute(
                     """
                     INSERT INTO knowledge_relationships
-                        (document_id, document_version_id, from_entity_id,
+                        (id, document_id, document_version_id, from_entity_id,
                          to_entity_id, relationship_type, description, confidence,
-                         status, source_page_start, source_page_end)
-                    VALUES (%s, %s, %s, %s, 'co_occurs_with', %s, 0.45, %s, %s, %s)
+                         status, source_page_start, source_page_end, metadata,
+                         created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, 'co_occurs_with', %s, 0.45, %s, %s, %s,
+                            %s, current_timestamp(), current_timestamp())
                     """,
                     (
+                        str(relationship_id),
                         str(version["document_id"]),
                         str(version_id),
                         str(from_id),
@@ -182,6 +191,7 @@ async def rebuild_version_knowledge(
                         status,
                         int(shared["physical_page_number"]),
                         int(shared["physical_page_number"]),
+                        Jsonb({}),
                     ),
                 )
                 stats["relationships"] += 1
@@ -202,9 +212,11 @@ async def rebuild_version_knowledge(
                     (id, document_id, document_version_id, workflow_key, title,
                      normalized_title, summary, content_type, prerequisites,
                      warnings, exceptions, confidence, status, source_page_start,
-                     source_page_end, metadata, approved_at, approved_by)
+                     source_page_end, metadata, approved_at, approved_by,
+                     created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, {approved_sql}, {approved_by_sql})
+                        %s, %s, %s, {approved_sql}, {approved_by_sql},
+                        current_timestamp(), current_timestamp())
                 """,
                 (
                     str(workflow_id),
@@ -262,8 +274,10 @@ async def rebuild_version_knowledge(
                     INSERT INTO workflow_steps
                         (id, workflow_id, document_page_id, step_number, action,
                          description, ui_element, conditions, warnings, exceptions,
-                         visual_callouts, confidence, status, source_page_number)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         visual_callouts, confidence, status, source_page_number,
+                         metadata, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, current_timestamp(), current_timestamp())
                     """,
                     (
                         str(step_id),
@@ -280,6 +294,7 @@ async def rebuild_version_knowledge(
                         step["confidence"],
                         status,
                         int(step_page["physical_page_number"]),
+                        Jsonb({}),
                     ),
                 )
                 step_ids_by_page[str(step_page["id"])].append((step_id, step))
@@ -306,17 +321,19 @@ async def rebuild_version_knowledge(
                     matched_step = _match_step(
                         step_ids_by_page.get(str(page["id"]), []), callout
                     )
+                    visual_id = uuid4()
                     await conn.execute(
                         """
                         INSERT INTO visual_references
-                            (document_id, document_version_id, document_page_id,
+                            (id, document_id, document_version_id, document_page_id,
                              workflow_step_id, callout_number, element_type, label,
                              action, description, bounding_box, page_number,
-                             image_path, status, metadata)
+                             image_path, status, metadata, created_at, updated_at)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s)
+                                %s, %s, %s, current_timestamp(), current_timestamp())
                         """,
                         (
+                            str(visual_id),
                             str(version["document_id"]),
                             str(version_id),
                             str(page["id"]),
@@ -353,14 +370,18 @@ async def rebuild_version_knowledge(
                         text = str(value).strip()
                         if not text:
                             continue
+                        rule_id = uuid4()
                         await conn.execute(
                             """
                             INSERT INTO knowledge_rules
-                                (document_id, document_version_id, workflow_id,
-                                 rule_type, rule_text, source_page_number, status)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                (id, document_id, document_version_id, workflow_id,
+                                 rule_type, rule_text, source_page_number, status,
+                                 metadata, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                    current_timestamp(), current_timestamp())
                             """,
                             (
+                                str(rule_id),
                                 str(version["document_id"]),
                                 str(version_id),
                                 str(workflow_id),
@@ -368,6 +389,7 @@ async def rebuild_version_knowledge(
                                 text[:8000],
                                 int(page["physical_page_number"]),
                                 status,
+                                Jsonb({}),
                             ),
                         )
                         stats["rules"] += 1
@@ -377,14 +399,18 @@ async def rebuild_version_knowledge(
                         ("warning", step["warnings"]),
                     ):
                         for value in values:
+                            rule_id = uuid4()
                             await conn.execute(
                                 """
                                 INSERT INTO knowledge_rules
-                                    (document_id, document_version_id, workflow_id,
-                                     rule_type, rule_text, source_page_number, status)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    (id, document_id, document_version_id, workflow_id,
+                                     rule_type, rule_text, source_page_number, status,
+                                     metadata, created_at, updated_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                        current_timestamp(), current_timestamp())
                                 """,
                                 (
+                                    str(rule_id),
                                     str(version["document_id"]),
                                     str(version_id),
                                     str(workflow_id),
@@ -392,6 +418,7 @@ async def rebuild_version_knowledge(
                                     str(value)[:8000],
                                     int(page["physical_page_number"]),
                                     status,
+                                    Jsonb({}),
                                 ),
                             )
                             stats["rules"] += 1
@@ -399,19 +426,16 @@ async def rebuild_version_knowledge(
             for page in group["pages"]:
                 markdown = _page_markdown(page)
                 if markdown:
+                    page_markdown_id = uuid4()
                     await conn.execute(
                         """
                         INSERT INTO page_markdown
-                            (document_page_id, document_version_id, markdown,
-                             content_hash, generator)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (document_page_id) DO UPDATE
-                            SET markdown = EXCLUDED.markdown,
-                                content_hash = EXCLUDED.content_hash,
-                                generator = EXCLUDED.generator,
-                                generated_at = now()
+                            (id, document_page_id, document_version_id, markdown,
+                             content_hash, generator, generated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, current_timestamp())
                         """,
                         (
+                            str(page_markdown_id),
                             str(page["id"]),
                             str(version_id),
                             markdown,
@@ -636,7 +660,7 @@ def _page_markdown(page: dict[str, Any]) -> str:
 
 
 async def _insert_source(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version: dict[str, Any],
     *,
     knowledge_type: str,
@@ -657,14 +681,17 @@ async def _insert_source(
             (str(version["id"]), page_number, page_number),
         )
     ).fetchone()
+    source_id = uuid4()
     await conn.execute(
         """
         INSERT INTO knowledge_sources
-            (knowledge_type, knowledge_id, document_id, document_version_id,
-             document_page_id, document_chunk_id, page_number, section_number, quote)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (id, knowledge_type, knowledge_id, document_id, document_version_id,
+             document_page_id, document_chunk_id, page_number, section_number, quote,
+             metadata, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, current_timestamp())
         """,
         (
+            str(source_id),
             knowledge_type,
             str(knowledge_id),
             str(version["document_id"]),
@@ -674,12 +701,13 @@ async def _insert_source(
             page_number,
             str((page.get("layout") or {}).get("section_number") or ""),
             quote[:4000],
+            Jsonb({}),
         ),
     )
 
 
 async def _detect_workflow_conflicts(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version: dict[str, Any],
     workflows: list[dict[str, Any]],
 ) -> int:
@@ -690,7 +718,8 @@ async def _detect_workflow_conflicts(
         rows = await (
             await conn.execute(
                 """
-                SELECT id, document_id, title, metadata->>'step_fingerprint' AS fingerprint
+                SELECT id, document_id, title,
+                       get_json_object(metadata, '$.step_fingerprint') AS fingerprint
                 FROM workflows
                 WHERE normalized_title = %s
                   AND document_version_id <> %s
@@ -725,21 +754,25 @@ async def _detect_workflow_conflicts(
             ).fetchone()
             if exists:
                 continue
+            conflict_id = uuid4()
             await conn.execute(
                 """
                 INSERT INTO knowledge_conflicts
-                    (document_id, conflict_type, left_knowledge_type,
+                    (id, document_id, conflict_type, left_knowledge_type,
                      left_knowledge_id, right_knowledge_type, right_knowledge_id,
-                     description, detected_by)
-                VALUES (%s, 'workflow_step_mismatch', 'workflow', %s,
-                        'workflow', %s, %s, 'system')
+                     description, status, detected_by, metadata, created_at, updated_at)
+                VALUES (%s, %s, 'workflow_step_mismatch', 'workflow', %s,
+                        'workflow', %s, %s, 'open', 'system', %s,
+                        current_timestamp(), current_timestamp())
                 """,
                 (
+                    str(conflict_id),
                     str(version["document_id"]),
                     str(workflow["id"]),
                     str(row["id"]),
                     f"Workflow '{workflow['title']}' has different steps in "
                     "another document version.",
+                    Jsonb({}),
                 ),
             )
             count += 1
@@ -749,7 +782,7 @@ async def _detect_workflow_conflicts(
 
 
 async def _detect_entity_conflicts(
-    conn: AsyncConnection, version: dict[str, Any]
+    conn: DatabricksConnection, version: dict[str, Any]
 ) -> int:
     rows = await (
         await conn.execute(
@@ -794,21 +827,25 @@ async def _detect_entity_conflicts(
         ).fetchone()
         if exists:
             continue
+        conflict_id = uuid4()
         await conn.execute(
             """
             INSERT INTO knowledge_conflicts
-                (document_id, conflict_type, left_knowledge_type,
+                (id, document_id, conflict_type, left_knowledge_type,
                  left_knowledge_id, right_knowledge_type, right_knowledge_id,
-                 description, detected_by)
-            VALUES (%s, 'entity_description_mismatch', 'entity', %s,
-                    'entity', %s, %s, 'system')
+                 description, status, detected_by, metadata, created_at, updated_at)
+            VALUES (%s, %s, 'entity_description_mismatch', 'entity', %s,
+                    'entity', %s, %s, 'open', 'system', %s,
+                    current_timestamp(), current_timestamp())
             """,
             (
+                str(conflict_id),
                 str(version["document_id"]),
                 str(row["id"]),
                 str(row["other_id"]),
                 f"Entity '{row['normalized_name']}' has different descriptions "
                 "across documents.",
+                Jsonb({}),
             ),
         )
         count += 1

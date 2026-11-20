@@ -1,5 +1,5 @@
-# Development and test dependencies (includes an embedded PostgreSQL 16 + pgvector
-# server for local development only; production uses a real PostgreSQL 16 instance).
+# Development and test dependencies. pgserver is retained only for legacy
+# integration fixtures that are being replaced by Databricks SQL tests.
 
 -r requirements.txt
 

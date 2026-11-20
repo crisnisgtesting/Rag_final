@@ -6,12 +6,12 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from psycopg import AsyncConnection
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_app_settings
 from app.auth.dependencies import CurrentUser, get_current_user
 from app.config import Settings
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.retrieval.embeddings import EmbeddingError, get_embedder
 from app.retrieval.search import RetrievalError, hybrid_search
@@ -31,7 +31,7 @@ class SearchRequest(BaseModel):
 @router.post("")
 async def search(
     payload: SearchRequest,
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:

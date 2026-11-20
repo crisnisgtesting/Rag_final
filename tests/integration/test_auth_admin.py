@@ -50,7 +50,7 @@ def test_vision_configuration_hides_secrets(api_client, auth_headers) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["active_provider"] in {"qwen", "gemini", "databricks"}
-    assert body["environment_default"] == "qwen"
+    assert body["environment_default"] == "databricks"
     assert len(body["providers"]) == 3
     text = json.dumps(body)
     assert "api_key" not in text.lower()

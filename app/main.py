@@ -16,6 +16,7 @@ from app import __version__
 from app.api.routers import admin, auth, chat, documents, health, jobs, knowledge, search
 from app.auth.rate_limit import SlidingWindowLimiter
 from app.config import Settings, get_settings
+from app.db.bootstrap import bootstrap_schema
 from app.db.pool import close_pool, init_pool
 from app.logging_conf import configure_logging, get_logger
 from app.middleware import (
@@ -23,6 +24,7 @@ from app.middleware import (
     RequestContextMiddleware,
     RequestLoggingMiddleware,
 )
+from app.storage.volume import init_volume_store, set_volume_store
 from app.vision.base import VisionConfigurationError, VisionError
 
 if sys.platform == "win32":  # psycopg async requires the selector loop on Windows
@@ -46,6 +48,9 @@ def _build_lifespan(settings: Settings):
             vision_provider=settings.vision_provider,
         )
         await init_pool(settings)
+        if settings.databricks_bootstrap_on_startup:
+            await bootstrap_schema(settings)
+        await init_volume_store(settings)
         try:
             from app.ingestion.job_runner import recover_stale_jobs
 
@@ -55,6 +60,7 @@ def _build_lifespan(settings: Settings):
                 logger.warning("job_recovery_failed", error=type(exc).__name__)
             yield
         finally:
+            set_volume_store(None)
             await close_pool()
             logger.info("application_stopped")
 

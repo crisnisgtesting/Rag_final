@@ -8,11 +8,11 @@ from uuid import UUID
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from psycopg import AsyncConnection
 
 from app.api.deps import get_app_settings
 from app.auth.security import decode_access_token
 from app.config import Settings
+from app.db.databricks import DatabricksConnection
 from app.db.pool import get_db
 from app.logging_conf import get_logger
 
@@ -43,19 +43,16 @@ def _unauthorized(detail: str = "Invalid or expired credentials") -> HTTPExcepti
     )
 
 
-async def load_user(conn: AsyncConnection, user_id: UUID) -> CurrentUser | None:
+async def load_user(conn: DatabricksConnection, user_id: UUID) -> CurrentUser | None:
     row = await (
         await conn.execute(
             """
             SELECT u.id, u.username, u.email, u.full_name, u.is_active,
-                   COALESCE(
-                       array_agg(ur.role_code) FILTER (WHERE ur.role_code IS NOT NULL),
-                       '{}'
-                   ) AS roles
+                   COALESCE(collect_set(ur.role_code), array()) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = %s
-            GROUP BY u.id
+            GROUP BY u.id, u.username, u.email, u.full_name, u.is_active
             """,
             (str(user_id),),
         )
@@ -63,7 +60,7 @@ async def load_user(conn: AsyncConnection, user_id: UUID) -> CurrentUser | None:
     if row is None:
         return None
     return CurrentUser(
-        id=row["id"],
+        id=UUID(str(row["id"])),
         username=row["username"],
         email=row["email"],
         full_name=row["full_name"],
@@ -75,7 +72,7 @@ async def load_user(conn: AsyncConnection, user_id: UUID) -> CurrentUser | None:
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    conn: AsyncConnection = Depends(get_db),
+    conn: DatabricksConnection = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> CurrentUser:
     if credentials is None or credentials.scheme.lower() != "bearer":

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.config import Settings
+from app.llm.base import LLMConfigurationError, LLMError, LLMMessage
+from app.llm.factory import build_llm_provider
 from app.vision.http import request_with_retry
 
 
@@ -214,6 +216,49 @@ class QwenChatProvider(ChatProvider):
         )
 
 
+class DatabricksChatProvider(ChatProvider):
+    provider_name = "databricks"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._provider = build_llm_provider(settings, provider="databricks")
+
+    @property
+    def model_name(self) -> str:
+        return self._provider.model_name
+
+    async def complete(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> ChatResult:
+        llm_messages = [LLMMessage(role="system", content=system)]
+        llm_messages.extend(
+            LLMMessage(role=message["role"], content=message["content"])
+            for message in messages
+        )
+        try:
+            result = await self._provider.complete(
+                llm_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except LLMConfigurationError as exc:
+            raise ChatConfigurationError(str(exc)) from exc
+        except LLMError as exc:
+            raise ChatError(str(exc)) from exc
+        return ChatResult(
+            content=result.content,
+            provider=self.provider_name,
+            model=result.model,
+            latency_ms=result.latency_ms,
+            usage=result.usage,
+        )
+
+
 def build_chat_provider(settings: Settings) -> ChatProvider:
     name = (settings.chat_provider or "").strip().lower()
     if name == "gemini":
@@ -221,5 +266,5 @@ def build_chat_provider(settings: Settings) -> ChatProvider:
     if name == "qwen":
         return QwenChatProvider(settings)
     if name == "databricks":
-        raise ChatConfigurationError("Databricks chat is not implemented in Phase 2")
+        return DatabricksChatProvider(settings)
     raise ChatConfigurationError(f"Unsupported chat provider '{settings.chat_provider}'")

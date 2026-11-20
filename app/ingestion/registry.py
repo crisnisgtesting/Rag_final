@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import re
-import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pymupdf
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
 
 from app.config import Settings
+from app.db.compat import Jsonb, decode_json_value
+from app.db.databricks import DatabricksConnection
 from app.logging_conf import get_logger
 from app.services.audit import record_audit
+from app.storage.volume import get_volume_store
 from app.utils.hashing import sha256_file
 
 logger = get_logger(__name__)
@@ -30,6 +31,17 @@ SUPPORTED_EXTENSIONS = {
     ".md": "markdown",
     ".markdown": "markdown",
 }
+
+JSON_FIELDS = {"analysis", "config", "error_details", "layout", "metadata", "stats"}
+
+
+def _decode_row(row: Any) -> Any:
+    if isinstance(row, Mapping):
+        return {
+            key: decode_json_value(value) if key in JSON_FIELDS else value
+            for key, value in row.items()
+        }
+    return row
 
 
 def safe_filename(name: str) -> str:
@@ -81,16 +93,21 @@ def _storage_path(version_id: UUID, suffix: str = ".pdf") -> str:
     return f"document_versions/{version_id}/source{suffix.lower()}"
 
 
-def resolve_storage_path(settings: Settings, storage_path: str) -> Path:
-    root = settings.data_dir.resolve()
-    path = (root / storage_path).resolve()
-    if root not in path.parents:
-        raise RegistryError("Stored document path escapes the data directory")
-    return path
+async def materialize_storage_path(settings: Settings, storage_path: str) -> Path:
+    store = get_volume_store()
+    relative = storage_path
+    if relative.startswith(f"{store.root}/"):
+        relative = relative[len(store.root) + 1 :]
+    data = await store.read_bytes(relative)
+    directory = settings.data_dir / "temporary" / "materialized"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{uuid4().hex}-{Path(relative).name}"
+    target.write_bytes(data)
+    return target
 
 
 async def register_document(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     path: Path,
     *,
@@ -149,7 +166,8 @@ async def register_document(
                 """
                 UPDATE documents
                 SET filename = %s, title = %s, document_type = %s,
-                    source = coalesce(source, 'inbox'), updated_at = now()
+                    source = coalesce(source, 'inbox'),
+                    updated_at = current_timestamp()
                 WHERE id = %s
                 """,
                 (filename, title, document_type, document_id),
@@ -167,8 +185,10 @@ async def register_document(
             await conn.execute(
                 """
                 INSERT INTO documents
-                    (id, title, filename, document_type, source, status, uploaded_by)
-                VALUES (%s, %s, %s, %s, 'inbox', 'draft', %s)
+                    (id, title, filename, document_type, source, status, uploaded_by,
+                     created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'inbox', 'draft', %s,
+                        current_timestamp(), current_timestamp())
                 """,
                 (
                     str(document_id),
@@ -179,16 +199,14 @@ async def register_document(
                 ),
             )
 
-        destination = settings.data_dir / storage_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
+        await get_volume_store().write_bytes(storage_path, path.read_bytes())
 
         await conn.execute(
             """
             INSERT INTO document_versions
                 (id, document_id, version_number, content_hash, storage_path,
-                 status, approval_status, metadata)
-            VALUES (%s, %s, %s, %s, %s, 'uploaded', 'draft', %s)
+                 status, approval_status, metadata, uploaded_at)
+            VALUES (%s, %s, %s, %s, %s, 'uploaded', 'draft', %s, current_timestamp())
             """,
             (
                 str(version_id),
@@ -231,7 +249,7 @@ async def register_document(
 
 
 async def register_pdf(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     path: Path,
     *,
@@ -247,7 +265,7 @@ async def register_pdf(
 
 
 async def scan_inbox(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     settings: Settings,
     *,
     actor_user_id: UUID | str | None = None,
@@ -272,10 +290,26 @@ async def scan_inbox(
     }
 
 
-async def list_documents(conn: AsyncConnection) -> list[dict[str, Any]]:
+async def list_documents(conn: DatabricksConnection) -> list[dict[str, Any]]:
     rows = await (
         await conn.execute(
             """
+            WITH ranked_versions AS (
+                SELECT dv.*,
+                       row_number() OVER (
+                           PARTITION BY dv.document_id
+                           ORDER BY dv.version_number DESC
+                       ) AS version_rank
+                FROM document_versions dv
+            ),
+            ranked_jobs AS (
+                SELECT ij.*,
+                       row_number() OVER (
+                           PARTITION BY ij.document_version_id
+                           ORDER BY ij.created_at DESC
+                       ) AS job_rank
+                FROM ingestion_jobs ij
+            )
             SELECT d.id, d.title, d.filename, d.status, d.created_at, d.updated_at,
                    d.current_version_id,
                    v.id AS latest_version_id, v.version_number,
@@ -284,18 +318,10 @@ async def list_documents(conn: AsyncConnection) -> list[dict[str, Any]]:
                    j.id AS latest_job_id, j.status AS latest_job_status,
                    j.stage AS latest_job_stage, j.progress AS latest_job_progress
             FROM documents d
-            LEFT JOIN LATERAL (
-                SELECT * FROM document_versions dv
-                WHERE dv.document_id = d.id
-                ORDER BY dv.version_number DESC
-                LIMIT 1
-            ) v ON true
-            LEFT JOIN LATERAL (
-                SELECT * FROM ingestion_jobs ij
-                WHERE ij.document_version_id = v.id
-                ORDER BY ij.created_at DESC
-                LIMIT 1
-            ) j ON true
+            LEFT JOIN ranked_versions v
+                ON v.document_id = d.id AND v.version_rank = 1
+            LEFT JOIN ranked_jobs j
+                ON j.document_version_id = v.id AND j.job_rank = 1
             ORDER BY d.created_at DESC, d.title
             """
         )
@@ -303,7 +329,7 @@ async def list_documents(conn: AsyncConnection) -> list[dict[str, Any]]:
     return rows
 
 
-async def document_detail(conn: AsyncConnection, document_id: UUID) -> dict[str, Any] | None:
+async def document_detail(conn: DatabricksConnection, document_id: UUID) -> dict[str, Any] | None:
     document = await (
         await conn.execute("SELECT * FROM documents WHERE id = %s", (str(document_id),))
     ).fetchone()
@@ -322,11 +348,11 @@ async def document_detail(conn: AsyncConnection, document_id: UUID) -> dict[str,
             (str(document_id),),
         )
     ).fetchall()
-    return {"document": document, "versions": versions}
+    return {"document": document, "versions": [_decode_row(row) for row in versions]}
 
 
 async def list_pages(
-    conn: AsyncConnection, version_id: UUID, *, limit: int = 500
+    conn: DatabricksConnection, version_id: UUID, *, limit: int = 500
 ) -> list[dict[str, Any]]:
     rows = await (
         await conn.execute(
@@ -337,7 +363,8 @@ async def list_pages(
                    vision_provider, vision_model, confidence, needs_review,
                    text_source, text_char_count, image_count, image_coverage,
                    layout,
-                   analysis->>'summary' AS analysis_summary
+                    get_json_object(analysis, '$.summary') AS analysis_summary
+
             FROM document_pages
             WHERE document_version_id = %s
             ORDER BY physical_page_number
@@ -346,11 +373,11 @@ async def list_pages(
             (str(version_id), limit),
         )
     ).fetchall()
-    return rows
+    return [_decode_row(row) for row in rows]
 
 
 async def list_chunks(
-    conn: AsyncConnection, version_id: UUID, *, limit: int = 100
+    conn: DatabricksConnection, version_id: UUID, *, limit: int = 100
 ) -> list[dict[str, Any]]:
     rows = await (
         await conn.execute(
@@ -371,7 +398,7 @@ async def list_chunks(
 
 
 async def version_context(
-    conn: AsyncConnection, version_id: UUID
+    conn: DatabricksConnection, version_id: UUID
 ) -> dict[str, Any] | None:
     row = await (
         await conn.execute(
@@ -385,11 +412,11 @@ async def version_context(
             (str(version_id),),
         )
     ).fetchone()
-    return row
+    return _decode_row(row)
 
 
 async def create_job(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version_id: UUID,
     *,
     provider: str,
@@ -414,17 +441,25 @@ async def create_job(
     if existing:
         raise RegistryError(f"An ingestion job is already {existing['status']} for this version")
 
+    job_id = uuid4()
     async with conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO ingestion_jobs
+                (id, document_version_id, job_type, status, selected_vision_provider,
+                 selected_vision_model, stage, config, created_at, updated_at)
+            VALUES (%s, %s, 'document_ingest', 'queued', %s, %s, 'queued', %s,
+                    current_timestamp(), current_timestamp())
+            """,
+            (str(job_id), str(version_id), provider, model, Jsonb(config)),
+        )
         job = await (
             await conn.execute(
                 """
-                INSERT INTO ingestion_jobs
-                    (document_version_id, job_type, status, selected_vision_provider,
-                     selected_vision_model, stage, config)
-                VALUES (%s, 'document_ingest', 'queued', %s, %s, 'queued', %s)
-                RETURNING id, document_version_id, status, stage, created_at
+                SELECT id, document_version_id, status, stage, created_at
+                FROM ingestion_jobs WHERE id = %s
                 """,
-                (str(version_id), provider, model, Jsonb(config)),
+                (str(job_id),),
             )
         ).fetchone()
         await conn.execute(
@@ -446,7 +481,7 @@ async def create_job(
     return job
 
 
-async def list_jobs(conn: AsyncConnection, *, limit: int = 100) -> list[dict[str, Any]]:
+async def list_jobs(conn: DatabricksConnection, *, limit: int = 100) -> list[dict[str, Any]]:
     rows = await (
         await conn.execute(
             """
@@ -460,11 +495,11 @@ async def list_jobs(conn: AsyncConnection, *, limit: int = 100) -> list[dict[str
             (limit,),
         )
     ).fetchall()
-    return rows
+    return [_decode_row(row) for row in rows]
 
 
-async def job_detail(conn: AsyncConnection, job_id: UUID) -> dict[str, Any] | None:
-    return await (
+async def job_detail(conn: DatabricksConnection, job_id: UUID) -> dict[str, Any] | None:
+    row = await (
         await conn.execute(
             """
             SELECT j.*, d.title, d.id AS document_id, v.version_number
@@ -476,24 +511,32 @@ async def job_detail(conn: AsyncConnection, job_id: UUID) -> dict[str, Any] | No
             (str(job_id),),
         )
     ).fetchone()
+    return _decode_row(row)
 
 
 async def request_cancel(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     *,
     actor_user_id: UUID | str | None = None,
 ) -> dict[str, Any] | None:
     async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE ingestion_jobs
+            SET cancel_requested = TRUE,
+                status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                completed_at = CASE WHEN status = 'queued'
+                                    THEN current_timestamp() ELSE completed_at END
+            WHERE id = %s
+            """,
+            (str(job_id),),
+        )
         job = await (
             await conn.execute(
                 """
-                UPDATE ingestion_jobs
-                SET cancel_requested = TRUE,
-                    status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
-                    completed_at = CASE WHEN status = 'queued' THEN now() ELSE completed_at END
-                WHERE id = %s
-                RETURNING id, status, cancel_requested
+                SELECT id, status, cancel_requested
+                FROM ingestion_jobs WHERE id = %s
                 """,
                 (str(job_id),),
             )
@@ -511,28 +554,34 @@ async def request_cancel(
 
 
 async def resume_job(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     job_id: UUID,
     *,
     actor_user_id: UUID | str | None = None,
 ) -> dict[str, Any]:
     async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE ingestion_jobs
+            SET status = 'queued', stage = 'queued', progress = 0,
+                cancel_requested = FALSE, error_details = NULL,
+                completed_at = NULL, heartbeat_at = NULL,
+                resume_count = resume_count + 1
+            WHERE id = %s
+              AND status IN ('paused', 'failed', 'cancelled')
+            """,
+            (str(job_id),),
+        )
         job = await (
             await conn.execute(
                 """
-                UPDATE ingestion_jobs
-                SET status = 'queued', stage = 'queued', progress = 0,
-                    cancel_requested = FALSE, error_details = NULL,
-                    completed_at = NULL, heartbeat_at = NULL,
-                    resume_count = resume_count + 1
-                WHERE id = %s
-                  AND status IN ('paused', 'failed', 'cancelled')
-                RETURNING id, document_version_id, status, stage
+                SELECT id, document_version_id, status, stage
+                FROM ingestion_jobs WHERE id = %s
                 """,
                 (str(job_id),),
             )
         ).fetchone()
-        if job is None:
+        if job is None or job["status"] != "queued":
             raise RegistryError("Only paused, failed or cancelled jobs can be resumed")
         version = await version_context(conn, job["document_version_id"])
         if version is None:
@@ -556,7 +605,7 @@ async def resume_job(
 
 
 async def approve_version(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version_id: UUID,
     *,
     actor_user_id: UUID | str | None = None,
@@ -582,7 +631,7 @@ async def approve_version(
         await conn.execute(
             """
             UPDATE document_versions
-            SET approval_status = 'superseded', superseded_at = now()
+            SET approval_status = 'superseded', superseded_at = current_timestamp()
             WHERE document_id = %s AND approval_status = 'approved' AND id <> %s
             """,
             (str(version["document_id"]), str(version_id)),
@@ -590,7 +639,7 @@ async def approve_version(
         await conn.execute(
             """
             UPDATE document_versions
-            SET approval_status = 'approved', approved_at = now(), approved_by = %s
+            SET approval_status = 'approved', approved_at = current_timestamp(), approved_by = %s
             WHERE id = %s
             """,
             (
@@ -618,7 +667,7 @@ async def approve_version(
 
 
 async def reject_version(
-    conn: AsyncConnection,
+    conn: DatabricksConnection,
     version_id: UUID,
     *,
     actor_user_id: UUID | str | None = None,
